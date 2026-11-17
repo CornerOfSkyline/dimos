@@ -1,0 +1,11 @@
+[req]
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+[dn]
+CN = dimos-relay
+[v3_req]
+subjectAltName = @alt
+[alt]
+IP.1 = 172.23.53.132
+DNS.1 = zjf-4090

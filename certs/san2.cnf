@@ -1,0 +1,14 @@
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = dimos-relay
+[v3_req]
+subjectAltName = @alt
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+[alt]
+IP.1 = 172.23.53.132
+DNS.1 = dimos.local
+DNS.2 = zjf-4090

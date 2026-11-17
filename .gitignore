@@ -1,0 +1,37 @@
+# Sensitive (never commit): TLS keys and relay access tokens.
+certs/*.key
+certs/*.csr
+certs/*.srl
+certs/relay-auth.json
+dimos/.env
+
+# Local machine templates of the above are fine to share.
+!certs/*.pem
+!certs/*.crt
+!certs/*.cnf
+
+# Large model serving environments and models (GBs; recreate from the
+# run scripts — see run_go2_*.sh headers).
+activevln-serve/
+streamvln-serve/
+activevln-model
+streamvln-model
+
+# Downloaded data (LFS archives already extracted).
+dimos/data/go2_short.db
+dimos/data/mujoco_sim/
+dimos/data/mujoco_office_555/
+dimos/data/person/
+dimos/data/.lfs/*.tar.gz
+
+# Runtime artifacts.
+dimos/logs/
+dimos/recordings/
+dimos/downloads/
+dimos/MUJOCO_LOG.TXT
+nohup.out
+*.pyc
+__pycache__/
+
+# Borrowed system library (symlink target; see run scripts).
+libs/
