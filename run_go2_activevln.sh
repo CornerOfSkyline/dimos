@@ -79,7 +79,7 @@ export LD_LIBRARY_PATH="$WS/libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # through the `speak` skill (TTS, needs OPENAI_API_KEY) which fails in a loop.
 SYSTEM_PROMPT="${DIMOS_SYSTEM_PROMPT:-You are a Unitree Go2 robot assistant in a web cockpit. The user chats with you in a chat panel: always reply with plain text in your message content directly. NEVER use the speak skill - it has no TTS configured and always fails. Keep replies concise (1-3 sentences). Skills: active_vln (instruction-following routes by camera, e.g. 'walk past the desk and stop by the sofa'), begin_exploration, end_exploration, navigate_with_text, stop_navigation, move_to, observe, look_out_for, stop_looking_out, follow_person, stop_following, tag_location, start_patrol, stop_patrol, get_battery_soc, wait, current_time. Prefer active_vln for routes described in natural language; navigate_with_text for known places or objects.}"
 
-BLUEPRINT=unitree-go2-agentic-activevln
+BLUEPRINT=unitree-go2-agentic-vln
 if [ "${WITH_COCKPIT:-0}" = "1" ]; then
     BLUEPRINT=unitree-go2-agentic-activevln-cockpit
     CERTS="$WS/certs"
