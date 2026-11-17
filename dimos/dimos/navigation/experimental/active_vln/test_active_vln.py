@@ -192,7 +192,13 @@ def test_data_url_converts_bgr_to_rgb_for_the_chat_api() -> None:
 
 
 class _SimTele:
-    """Publishes the commanded twist and integrates it into the fake odom."""
+    """Publishes the commanded twist and integrates it into the fake odom.
+
+    *gain* models a plant that tracks faster than commanded (the MuJoCo Go2
+    moves ~5x the commanded linear and ~2.8x the commanded angular rate);
+    *lag_tau* gives that amplified response first-order momentum (None =
+    instant, the adversarial limit).
+    """
 
     def __init__(
         self,
@@ -200,11 +206,17 @@ class _SimTele:
         on_publish: Callable[[Twist], None] | None = None,
         freeze: bool = False,
         lose_odom_after: int | None = None,
+        gain: float = 1.0,
+        lag_tau: float | None = None,
     ) -> None:
         self.skill = skill
         self.on_publish = on_publish
         self.freeze = freeze  # a blocked robot: commanded speed, no ground
         self.lose_odom_after = lose_odom_after
+        self.gain = gain
+        self.lag_tau = lag_tau
+        self._v_rate = 0.0
+        self._w_rate = 0.0
         self.twists: list[Twist] = []
 
     def publish(self, twist: Twist) -> None:
@@ -219,10 +231,18 @@ class _SimTele:
         if self.freeze or twist == Twist.zero():
             return
         dt = 1.0 / self.skill.config.drive_hz
+        if self.lag_tau is None:
+            v_eff = self.gain * twist.linear.x
+            w_eff = self.gain * twist.angular.z
+        else:  # first-order lag toward the amplified command (momentum)
+            k = min(1.0, dt / self.lag_tau)
+            self._v_rate += (self.gain * twist.linear.x - self._v_rate) * k
+            self._w_rate += (self.gain * twist.angular.z - self._w_rate) * k
+            v_eff, w_eff = self._v_rate, self._w_rate
         yaw = pose.orientation.to_euler().yaw
-        x = pose.position.x + twist.linear.x * np.cos(yaw) * dt
-        y = pose.position.y + twist.linear.x * np.sin(yaw) * dt
-        yaw += twist.angular.z * dt
+        x = pose.position.x + v_eff * np.cos(yaw) * dt
+        y = pose.position.y + v_eff * np.sin(yaw) * dt
+        yaw += w_eff * dt
         self.skill._latest_odom = _pose(x, y, float(np.degrees(yaw)))
 
 
@@ -292,6 +312,39 @@ def test_pd_drive_survives_odom_loss_and_rests() -> None:
     target = _relative_goal(skill._latest_odom, 0.25, 0.0)
     assert _pd_drive(skill, target) is False
     assert tele.twists[-1] == Twist.zero()
+
+
+def test_pd_drive_converges_on_a_plant_tracking_faster_than_commanded() -> None:
+    # The MuJoCo Go2 tracks ~5x the commanded linear and ~2.8x the commanded
+    # angular rate (measured live: 0.75 m in 0.3 s at a 0.5 m/s clamp; ~16
+    # deg from one 0.79 rad/s command) with ~0.2 s of momentum. The official
+    # controller (measured-velocity damping) handles it when the command rate
+    # keeps the per-cycle loop gain well under 1 — the sim stack runs
+    # drive_hz=50. At the real-robot 10 Hz the same amplified plant sits at a
+    # loop gain near 1 and relay-oscillates (30 s timeouts observed live);
+    # see artifacts/vln_m0/call_chain.md.
+    for gain in (2.8, 5.0):
+        skill, tele = _sim_skill(drive_hz=50.0)
+        tele.gain = gain
+        tele.lag_tau = 0.2  # the plant's momentum (no instant-gain teleporting)
+        target = _relative_goal(skill._latest_odom, 0.25, 0.0)
+        assert _pd_drive(skill, target) is True, f"forward goal did not converge at gain {gain}"
+        pose = skill._latest_odom
+        assert pose is not None
+        assert (pose.position.x, pose.position.y) == pytest.approx((0.25, 0.0), abs=0.06)
+        assert tele.twists[-1] == Twist.zero()
+
+        skill, tele = _sim_skill(drive_hz=50.0)
+        tele.gain = gain
+        tele.lag_tau = 0.2
+        target = _relative_goal(skill._latest_odom, 0.0, 15.0)
+        assert _pd_drive(skill, target, turn_only=True) is True, (
+            f"turn goal did not converge at gain {gain}"
+        )
+        pose = skill._latest_odom
+        assert pose is not None
+        assert np.degrees(pose.orientation.to_euler().yaw) == pytest.approx(15.0, abs=3.5)
+        assert tele.twists[-1] == Twist.zero()
 
 
 # -- run state is per-instance (the class-level Event regression) -------------

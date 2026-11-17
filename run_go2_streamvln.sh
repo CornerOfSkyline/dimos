@@ -95,11 +95,16 @@ if ! ss -tln 2>/dev/null | grep -q ":7780 "; then
 fi
 
 echo "==> cockpit: https://$LAN_IP:7780 | stream_vln skill -> http://localhost:$PORT/eval_vln"
+# drive-hz 50: the MuJoCo Go2 tracks ~2-5x the commanded rate, so the
+# real-robot 10 Hz PD rate sits at a per-cycle loop gain near 1 and turns
+# relay-oscillate (30 s timeouts measured); 50 Hz is comfortably stable
+# (all 6 basic-motion cases pass — artifacts/vln_m0/basic_actions).
 exec "$REPO/.venv/bin/dimos" --simulation run unitree-go2-agentic-activevln-cockpit \
     --vln-policy streamvln \
     --agent.model "${OLLAMA_MODEL:-ollama:qwen3-vl:32b}" \
     --agent.system-prompt "$SYSTEM_PROMPT" \
     --streamvlnskill.server-url "http://localhost:$PORT/eval_vln" \
+    --streamvlnskill.drive-hz 50 \
     --listen-host 0.0.0.0 \
     --relay-url "https://$LAN_IP:7780" \
     --dynamicrelaybridge_940788bb41.relay-ca "$CERTS/dimos-relay-ca.pem" \

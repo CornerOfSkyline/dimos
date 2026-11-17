@@ -99,11 +99,16 @@ if [ "${WITH_COCKPIT:-0}" = "1" ]; then
         sleep 4
     fi
     echo "==> cockpit: https://$LAN_IP:7780 (viewer token in $CERTS/relay-auth.json)"
+    # drive-hz 50: the MuJoCo Go2 tracks ~2-5x the commanded rate, so the
+    # real-robot 10 Hz PD rate sits at a per-cycle loop gain near 1 and turns
+    # relay-oscillate (30 s timeouts measured); 50 Hz is comfortably stable
+    # (all 6 basic-motion cases pass — artifacts/vln_m0/basic_actions).
     exec "$REPO/.venv/bin/dimos" --simulation run "$BLUEPRINT" \
         --agent.model "${OLLAMA_MODEL:-ollama:qwen3-vl:32b}" \
         --agent.system-prompt "$SYSTEM_PROMPT" \
         --activevlnskill.base-url "http://localhost:$PORT/v1" \
         --activevlnskill.model activevln \
+        --activevlnskill.drive-hz 50 \
         --listen-host 0.0.0.0 \
         --relay-url "https://$LAN_IP:7780" \
         --dynamicrelaybridge_940788bb41.relay-ca "$CERTS/dimos-relay-ca.pem" \
@@ -118,6 +123,7 @@ exec "$REPO/.venv/bin/dimos" --simulation run "$BLUEPRINT" \
     --agent.system-prompt "$SYSTEM_PROMPT" \
     --activevlnskill.base-url "http://localhost:$PORT/v1" \
     --activevlnskill.model activevln \
+    --activevlnskill.drive-hz 50 \
     --rerunbridgemodule.rerun-open web \
     --listen-host "${LISTEN_HOST:-127.0.0.1}" \
     "$@"

@@ -494,11 +494,22 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
     """PD velocity homing to *target* — the official deployment's controller.
 
     10 Hz loop: forward-axis and yaw errors from the odom to the target, PD
-    step (the deployment's gains), clamped velocities on tele_cmd_vel.
-    Completes — True — only when the driven errors are inside the done
-    thresholds, so the asked displacement happened by construction; no
-    planner arrival state to trust. False on stop (urgent stop clears the
-    running flag), odom loss, or timeout, always leaving a zero twist.
+    step (the deployment's gains) damped by the MEASURED velocity — the
+    official controller's own term (realworld/pid_controller.py solves with
+    the robot's reported [v, w]; damping on the last commanded value instead
+    underdamps any plant that tracks faster than commanded) — clamped
+    velocities on tele_cmd_vel. Completes — True — only when the driven
+    errors are inside the done thresholds, so the asked displacement
+    happened by construction; no planner arrival state to trust. False on
+    stop (urgent stop clears the running flag), odom loss, or timeout,
+    always leaving a zero twist.
+
+    The command rate is part of the stability story on plants that track
+    faster than commanded: the MuJoCo Go2 runs ~2-5x the commanded rate
+    (measured live), so at the default 10 Hz the per-cycle loop gain sits
+    near 1 and turns relay-oscillate (30 s timeouts observed live); the sim
+    stack configures drive_hz=50, where the loop is comfortably stable.
+    Real hardware with tight velocity tracking runs the official 10 Hz.
 
     *turn_only* (turn-in-place goals) drives the yaw loop alone: a quadruped
     turning in place drifts positionally, and correcting that drift makes the
@@ -517,16 +528,30 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
     done_rad = math.radians(cfg.done_deg)
     dt = 1.0 / cfg.drive_hz
     deadline = time.monotonic() + cfg.step_timeout
-    prev_v = 0.0
-    prev_w = 0.0
     stuck_since: float | None = None
     reference = skill._latest_odom
     target_yaw = target.orientation.to_euler().yaw
+    prev_pose = skill._latest_odom
+    prev_t = time.monotonic()
     while time.monotonic() < deadline and skill._running.is_set():
         pose = skill._latest_odom
         if pose is None:
             break
+        now = time.monotonic()
         yaw = pose.orientation.to_euler().yaw
+        # Measured velocity (finite differences on the odom between cycles) —
+        # the official controller's damping term. Zero when the odom stands
+        # still between cycles (or is a fresh equal pose).
+        v_meas, w_meas = 0.0, 0.0
+        if prev_pose is not None and pose is not prev_pose:
+            dt_meas = now - prev_t
+            if dt_meas > 1e-3:
+                prev_yaw = prev_pose.orientation.to_euler().yaw
+                dx = pose.position.x - prev_pose.position.x
+                dy = pose.position.y - prev_pose.position.y
+                v_meas = (dx * math.cos(prev_yaw) + dy * math.sin(prev_yaw)) / dt_meas
+                w_meas = ((yaw - prev_yaw + math.pi) % (2 * math.pi) - math.pi) / dt_meas
+        prev_pose, prev_t = pose, now
         e_r = (target_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
         if turn_only:
             if abs(e_r) <= done_rad:
@@ -540,7 +565,7 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
             if abs(e_p) <= cfg.done_m and abs(e_r) <= done_rad:
                 skill.tele_cmd_vel.publish(Twist.zero())
                 return True
-            v = cfg.kp_trans * max(-1.0, min(1.0, e_p)) - cfg.kd_trans * prev_v
+            v = cfg.kp_trans * max(-1.0, min(1.0, e_p)) - cfg.kd_trans * v_meas
             v = max(-cfg.max_v, min(cfg.max_v, v))
             # Blocked detection: commanding real speed but covering no ground.
             if reference is not None and abs(v) > 0.1:
@@ -558,10 +583,9 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
                 else:
                     stuck_since = None
                 reference = pose
-        w = cfg.kp_yaw * max(-1.0, min(1.0, e_r)) - cfg.kd_yaw * prev_w
+        w = cfg.kp_yaw * max(-1.0, min(1.0, e_r)) - cfg.kd_yaw * w_meas
         w = max(-cfg.max_w, min(cfg.max_w, w))
         skill.tele_cmd_vel.publish(Twist(linear=Vector3(v, 0.0, 0.0), angular=Vector3(0.0, 0.0, w)))
-        prev_v, prev_w = v, w
         time.sleep(dt)
     skill.tele_cmd_vel.publish(Twist.zero())
     return False
