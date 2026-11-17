@@ -1,0 +1,65 @@
+# Copyright 2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""`dimos map view`: open the last map cloud of a `.db`/`.mcap` recording in rerun."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import typer
+
+from dimos.utils.executable import find_executable
+
+
+def main(
+    path: Path = typer.Argument(..., help="Recording (.db/.mcap) whose last map cloud to view"),
+    stream: str | None = typer.Option(
+        None, "--stream", help="Stream holding the map cloud; by default the recording's own map"
+    ),
+    voxel: float = typer.Option(0.05, "--voxel", help="Rendered point size (m)"),
+    bottom_cutoff: float | None = typer.Option(
+        None,
+        "--bottom-cutoff",
+        help="Drop points below this Z (m) when rendering; e.g. 0 strips the floor",
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", help="Write a .rrd instead of opening the viewer"
+    ),
+) -> None:
+    """Load a recording's last map cloud and display it in rerun."""
+    import rerun as rr
+
+    from dimos.mapping.relocalization.module import load_premap
+    from dimos.visualization.rerun.init import rerun_init
+
+    cloud = load_premap(str(path), stream)
+    print(f"{path}: {len(cloud.pointcloud.points)} points in {cloud.frame_id!r}")
+
+    rerun_init("dimos map view")
+    if out is not None:
+        rr.save(str(out))
+    else:
+        rr.spawn(executable_path=find_executable("rerun"))
+    rr.log(
+        f"world/{path.name.split('.')[0]}/pointcloud",
+        cloud.to_rerun(voxel_size=voxel / 2, bottom_cutoff=bottom_cutoff),
+        static=True,
+    )
+    if out is not None:
+        print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    typer.run(main)

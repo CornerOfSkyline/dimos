@@ -1,0 +1,206 @@
+# Copyright 2025-2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Stack composition, process management, and shared transport settings.
+
+Module and subsystem settings belong to their owners' configuration classes.
+"""
+
+import os
+from typing import Literal, TypeAlias
+
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from dimos.constants import DEFAULT_BUILD_NATIVE
+from dimos.visualization.rerun.constants import ViewerBackend
+
+TransportBackend: TypeAlias = Literal["lcm", "zenoh"]
+# How one zenoh session joins the network.
+ZenohMode: TypeAlias = Literal["peer", "client", "router"]
+# How every session in every process joins it. A router binds a port only one
+# process can hold, so it is pinned on the one session that owns that port.
+ZenohProcessMode: TypeAlias = Literal["peer", "client"]
+
+# pytest exports PYTEST_VERSION to the whole process tree. Tests must not pick up
+# a developer's .env (ROBOT_IP, SIMULATION, ...); dimos/conftest.py exports the
+# LLM API keys itself.
+ENV_FILE = None if "PYTEST_VERSION" in os.environ else ".env"
+
+
+class GlobalConfig(BaseSettings):
+    robot_ip: str | None = None
+    robot_ips: str | None = None
+    simulation: str = ""
+    replay: bool = False
+    replay_db: str = "go2_short"
+    record: Literal["", "sqlite", "mcap"] = ""
+    record_engine: Literal["python", "rust"] = Field(default="python", validate_default=True)
+    record_topics: str = "*"  # comma-separated globs on the topic slug (/a/b -> a_b)
+    record_encoding_threads: int | None = Field(default=None, ge=1)
+    # How every zenoh session this process opens joins the network.
+    zenoh_mode: ZenohProcessMode = "peer"
+    # Extra locators every session dials, alongside those derived from --robot-ip.
+    # Comma-separated, e.g. tcp/127.0.0.1:7447. Names a router or any non-robot peer.
+    zenoh_connect: str = ""
+    # Discover zenoh peers across the network.
+    # Toggling off drops back to loopback-only discovery:
+    # Sibling worker processes still find each other,
+    # remote peers come solely from the connect endpoints derived from --robot-ip
+    zenoh_scouting: bool = False
+    # Interface multicast scouting binds to, e.g. wlan0.
+    # Empty derives it from zenoh_scouting.
+    zenoh_interface: str = ""
+    # Whether multicast scouting runs at all. zenoh_scouting only sets its reach.
+    zenoh_multicast: bool = True
+    # Multicast group scouting joins, e.g. 224.0.0.224:7446. Empty takes zenoh's
+    # own. Moving it walks a session onto a private discovery bus, which is how
+    # parallel sessions on one machine stay apart (LCM_DEFAULT_URL's analog).
+    zenoh_scout_addr: str = ""
+    # Whether peers propagate the peers they already know over established links.
+    # Unlike multicast scouting this reaches nothing new on the LAN, and zenoh
+    # needs it to resolve the key expressions a linked peer sends.
+    zenoh_gossip: bool | None = True
+    # Seconds ZenohService.start() blocks for the configured connect endpoints to
+    # link before giving up and continuing. 0 disables the wait.
+    zenoh_connect_timeout: float = Field(default=1.0, ge=0, le=86400)
+    # Off: share a zenoh bus with a stack that already owns the Coordinator name.
+    serve_coordinator_rpc: bool = True
+    # Isolates this run's zenoh streams under dimos-domains/<name>/; a hosted run pins its run id.
+    zenoh_domain: str = Field(default="", pattern=r"^[A-Za-z0-9_.-]*$")
+    viewer: ViewerBackend = "rerun"
+    n_workers: int = 2
+    scene_package: str | None = None
+    robot_model: str | None = None
+    # Robot geometry shared by every navigation and patrol module in a stack;
+    # a module config may still override it for itself.
+    robot_width: float = 0.3
+    robot_rotation_diameter: float = 0.6
+    # `DIMOS_TRANSPORT` (or `.env`) is the single switch read by every process
+    # (dimos, humancli, agentspy, dtop). The `transport` alias keeps the bare
+    # env name and the `--transport` CLI flag (which sets the field by name) working.
+    transport: TransportBackend = Field(
+        default="zenoh",
+        validation_alias=AliasChoices("DIMOS_TRANSPORT", "transport"),
+    )
+    build_native: bool = DEFAULT_BUILD_NATIVE
+    dtop: bool = False
+    listen_host: str = "127.0.0.1"
+    local_relay: bool = False
+    topic_metadata: bool = False
+    """Publish bounded Zenoh stream descriptors for a trusted topic service."""
+    relay_url: str | None = None
+    """HTTP URL of a relay started elsewhere (e.g. http://localhost:7780); the
+    bridge discovers its WebTransport endpoint through /api/info."""
+    hf_endpoint: str | None = None
+    """Hugging Face endpoint for model downloads, e.g. a mirror such as
+    https://hf-mirror.com. Exported to HF_ENDPOINT before huggingface_hub
+    or transformers is first imported (both read it at import time; worker
+    processes inherit it through the fork). Set it in .env, the
+    environment, or with --hf-endpoint; empty keeps the libraries'
+    default (https://huggingface.co)."""
+    ollama_base_url: str | None = None
+    """Base URL of a remote Ollama server, e.g. http://192.168.1.50:11434.
+    Exported to OLLAMA_BASE_URL (worker processes inherit it through the
+    fork) and applied to every ollama: model init, so agent models served
+    by another machine's Ollama work by name alone. Set it in .env, the
+    environment, or with --ollama-base-url; empty uses the local Ollama."""
+    vln_policy: Literal["activevln", "streamvln"] = "activevln"
+    """Which VLN policy skill the go2 blueprints wire up for instruction-
+    following routes: activevln (multi-turn RL, OpenAI-compatible endpoint)
+    or streamvln (SlowFast streaming context, real-world HTTP server).
+    Both skills' execution side is shared; this picks the policy server.
+    Set it in .env, the environment, or with --vln-policy."""
+
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+        validate_assignment=True,
+    )
+
+    @field_validator("record_engine")
+    @classmethod
+    def _validate_record_engine(cls, value: str, info: ValidationInfo) -> str:
+        if info.data.get("record") == "mcap" and value != "rust":
+            raise ValueError("MCAP recording requires --record-engine rust")
+        return value
+
+    @field_validator("record_encoding_threads")
+    @classmethod
+    def _validate_record_encoding_threads(
+        cls, value: int | None, info: ValidationInfo
+    ) -> int | None:
+        if value is not None and info.data.get("record_engine") != "rust":
+            raise ValueError("--record-encoding-threads is valid only with --record-engine rust")
+        return value
+
+    def update(self, **kwargs: object) -> None:
+        """Update config fields in place."""
+        for key, value in kwargs.items():
+            if key not in type(self).model_fields:
+                raise AttributeError(f"GlobalConfig has no field '{key}'")
+            setattr(self, key, value)
+        if "hf_endpoint" in kwargs:
+            _apply_hf_endpoint(self.hf_endpoint)
+        if "ollama_base_url" in kwargs:
+            _apply_ollama_base_url(self.ollama_base_url)
+
+    @property
+    def parsed_robot_ips(self) -> tuple[str, ...]:
+        """Parse robot IPs without requiring them during blueprint discovery."""
+        return tuple(x.strip() for x in (self.robot_ips or "").split(",") if x.strip())
+
+    @property
+    def processed_robot_ips(self) -> tuple[str, ...]:
+        ips = self.parsed_robot_ips
+        if error := require_robot_ips(ips):
+            raise ValueError(error)
+        return ips
+
+
+def _apply_hf_endpoint(endpoint: str | None) -> None:
+    """Export the configured endpoint for huggingface_hub and transformers.
+
+    Both read HF_ENDPOINT at import time, before any model download, so it
+    must land in os.environ before they load. Worker processes inherit it
+    through the fork.
+    """
+    if endpoint:
+        os.environ["HF_ENDPOINT"] = endpoint
+
+
+def _apply_ollama_base_url(base_url: str | None) -> None:
+    """Export the configured Ollama server for ollama: model inits.
+
+    Workers inherit it through the fork; init_model passes it to
+    ChatOllama (which also reads OLLAMA_BASE_URL itself, so plain
+    langchain callers follow it too).
+    """
+    if base_url:
+        os.environ["OLLAMA_BASE_URL"] = base_url
+    else:
+        os.environ.pop("OLLAMA_BASE_URL", None)
+
+
+global_config = GlobalConfig()
+_apply_hf_endpoint(global_config.hf_endpoint)
+_apply_ollama_base_url(global_config.ollama_base_url)
+
+
+def require_robot_ips(ips: tuple[str, ...]) -> str | None:
+    """Validate the IPs used to compose a blueprint, independent of runtime globals."""
+    if not ips:
+        return "No robot IPs specified. Set ROBOT_IPS or --robot-ips to at least one IP."
+    return None

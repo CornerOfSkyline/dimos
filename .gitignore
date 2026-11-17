@@ -35,3 +35,9 @@ __pycache__/
 
 # Borrowed system library (symlink target; see run scripts).
 libs/
+.vscode/*
+!.vscode/settings.json
+!.vscode/c_cpp_properties.json
+
+# LFS-pulled data archives (gitignored above at data/ level too)
+dimos/data/.lfs/
