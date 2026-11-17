@@ -32,17 +32,27 @@
  import argparse
  import numpy as np
  import json
-@@ -6,7 +34,8 @@
+@@ -6,7 +34,18 @@
  import sys
  import os
  import transformers
 -sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 +
-+sys.path.insert(0, os.environ.get("STREAMVLN_CODE_ROOT", "/tmp/StreamVLN"))
++# Patch 2: the StreamVLN code root (the checkout containing the packages
++# `streamvln/` and `model/`) is taken from STREAMVLN_CODE_ROOT (default
++# /tmp/StreamVLN) instead of this script's parent directory — this copy does
++# not live inside the upstream checkout. Both entries the original had are
++# added: the root (for the `streamvln` package) and its streamvln/ subdir
++# (the original's implicit sys.path[0] as the script's own directory, where
++# the `model` package lives).
++
++_streamvln_code_root = os.environ.get("STREAMVLN_CODE_ROOT", "/tmp/StreamVLN")
++sys.path.insert(0, _streamvln_code_root)
++sys.path.insert(0, os.path.join(_streamvln_code_root, "streamvln"))
  
  from flask import Flask, request, jsonify
  from PIL import Image, ImageDraw, ImageFont
-@@ -15,6 +44,7 @@
+@@ -15,6 +54,7 @@
  from model.stream_video_vln import StreamVLNForCausalLM
  
  app = Flask(__name__)
@@ -50,7 +60,7 @@
  action_seq = np.zeros(4)
  idx = 0
  terminate = False
-@@ -49,7 +79,7 @@
+@@ -49,7 +89,7 @@
  
      text_color = 'white'
      y_position = box_y + padding
@@ -59,7 +69,7 @@
      for line in text_content:
          draw.text((box_x + padding, y_position), line, fill=text_color, font=font)
          bbox = draw.textbbox((0, 0), line, font=font)
-@@ -65,15 +95,22 @@
+@@ -65,15 +105,22 @@
      image_file = request.files['image']
      json_data = request.form['json']
      data = json.loads(json_data)
@@ -85,7 +95,7 @@
      policy_init = data['reset']
      if policy_init:
          start_time = time.time()
-@@ -84,13 +121,13 @@
+@@ -84,13 +131,13 @@
          os.makedirs(output_dir, exist_ok=True)
          print("init reset model!!!")
          evaluator.reset_memory()
@@ -102,7 +112,7 @@
      for i in range(4):
          t1 = time.time()
          depth = np.zeros((image.shape[0], image.shape[1], 1))
-@@ -103,14 +140,14 @@
+@@ -103,14 +150,14 @@
          llm_output = return_llm_output if return_llm_output is not None else llm_output
          print(f"one evalute cost {time.time() - t1}")
          # total_generate_time += generate_time
@@ -120,7 +130,7 @@
      str_action = [str(i) for i in action_seq]
      str_action = ''.join(str_action)
      str_action = str_action.replace('1', '↑')  # 前箭头
-@@ -121,13 +158,13 @@
+@@ -121,13 +168,13 @@
          total_generate_time -= 0.3
  
      annotate_image(idx, image, start_time, total_generate_time, str_action, output_dir)
@@ -137,7 +147,7 @@
  if __name__ == '__main__':
      global local_rank
      parser = argparse.ArgumentParser()
-@@ -139,13 +176,13 @@
+@@ -139,13 +186,13 @@
                          help= "Maximum sequence length. Sequences will be right padded (and possibly truncated).")
      parser.add_argument('--device', default='cuda:0',
                          help='device to use for testing')
@@ -153,7 +163,7 @@
      config = transformers.AutoConfig.from_pretrained(args.model_path)
      model = StreamVLNForCausalLM.from_pretrained(
                  args.model_path,
-@@ -159,24 +196,24 @@
+@@ -159,24 +206,24 @@
      model.requires_grad_(False)
      model.to(args.device)
      model.eval()

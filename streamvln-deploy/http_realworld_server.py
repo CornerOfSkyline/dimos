@@ -35,7 +35,17 @@ import sys
 import os
 import transformers
 
-sys.path.insert(0, os.environ.get("STREAMVLN_CODE_ROOT", "/tmp/StreamVLN"))
+# Patch 2: the StreamVLN code root (the checkout containing the packages
+# `streamvln/` and `model/`) is taken from STREAMVLN_CODE_ROOT (default
+# /tmp/StreamVLN) instead of this script's parent directory — this copy does
+# not live inside the upstream checkout. Both entries the original had are
+# added: the root (for the `streamvln` package) and its streamvln/ subdir
+# (the original's implicit sys.path[0] as the script's own directory, where
+# the `model` package lives).
+
+_streamvln_code_root = os.environ.get("STREAMVLN_CODE_ROOT", "/tmp/StreamVLN")
+sys.path.insert(0, _streamvln_code_root)
+sys.path.insert(0, os.path.join(_streamvln_code_root, "streamvln"))
 
 from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
