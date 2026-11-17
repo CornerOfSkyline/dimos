@@ -1,0 +1,50 @@
+{
+  "episode_id": "activevln_ep3_stop",
+  "policy": "activevln",
+  "instruction": "Move forward past the chairs and stop in the open area.",
+  "started": "2026-11-17T14:28:31.137491+00:00",
+  "ended": "2026-11-17T14:28:55.685970+00:00",
+  "duration_s": 24.547,
+  "mcp_tool_output": "Stopped by stop_navigation or stop_movement.",
+  "skill_completion_line": {
+    "t": 1794925732.61727,
+    "event": "SKILL active_vln duration_ms=20076.4"
+  },
+  "termination_reason": "STOPPED_BY_USER",
+  "policy_turns": 6,
+  "turn_details": [
+    "1: turn right 45 degrees, turn right 15 degrees, turn right 15 degrees",
+    "2: turn right 45 degrees, turn right 30 degrees, move forward 25cm",
+    "3: move forward 25cm, turn right 15 degrees, move forward 25cm",
+    "4: turn right 15 degrees, turn right 15 degrees, turn right 15 degrees",
+    "5: move forward 25cm, turn left 15 degrees, move forward 25cm",
+    "6: turn right 15 degrees, turn right 15 degrees, turn right 30 degrees"
+  ],
+  "server_log_lines": [],
+  "instruction_reached_server": null,
+  "odom_before": {
+    "t": 1794925711.1188524,
+    "x": -0.0983283616178147,
+    "y": 1.7455583814466866,
+    "yaw_deg": 75.80920299379588
+  },
+  "odom_after": {
+    "t": 1794925735.6809614,
+    "x": 0.3306870944794963,
+    "y": 0.6726248861031975,
+    "yaw_deg": -138.66063592062366
+  },
+  "distance_m": 1.1555,
+  "stop": {
+    "requested_at_cli_launch": 1794925731.1535027,
+    "delivery": {
+      "t": 1794925732.6171987,
+      "log_ts": "2026-11-17T14:28:52.417150Z"
+    },
+    "mode": "agent_send_urgent_stop",
+    "cli_launch_to_last_nonzero_tele_cmd_vel_s": 1.263,
+    "cli_launch_to_last_nonzero_cmd_vel_s": 1.264,
+    "delivery_to_last_nonzero_tele_cmd_vel_s": -0.2,
+    "target_lt_2s": true
+  }
+}

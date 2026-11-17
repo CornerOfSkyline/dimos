@@ -189,6 +189,11 @@ def _termination_tag(
         or "stop" in (last_turn.get("answer") or "").lower()
     ):
         return "POLICY_SAID_STOP"
+    # ActiveVLN answers carry the turn number ("50: move forward ...");
+    # hitting the configured budget (max_turns=50) is its own reason.
+    last_answer = (last_turn.get("answer") or "").split(":", 1)[0]
+    if last_answer.strip().isdigit() and int(last_answer) >= 50:
+        return "TURN_BUDGET_SPENT"
     if mcp_output and "stop" in mcp_output.lower():
         return "COMPLETED"
     return "COMPLETED_UNVERIFIED"
@@ -255,7 +260,7 @@ def main() -> None:
         def call_tool() -> None:
             mcp_out.append(_mcp_call(tool, {"instruction": args.instruction}, args.tool_timeout))
 
-        thread = threading.Thread(target=call_tool)
+        thread = threading.Thread(target=call_tool, daemon=True)
         thread.start()
 
         # Wait for the SKILL completion line (the episode end), issuing the
@@ -291,7 +296,11 @@ def main() -> None:
                     _mcp_call(stop_tool, {}, 30.0)
                     rec.stop_events.append({"t": stop_requested_at, "mode": f"mcp_{stop_tool}"})
             time.sleep(0.05)
-        thread.join(timeout=30.0)
+        # The CLI result is best-effort: the skill's true end marker is the
+        # log's SKILL completion line. The CLI thread is a daemon — a hung
+        # CLI (its HTTP patience is shorter than a long episode) must not
+        # block recording the episode.
+        thread.join(timeout=10.0)
 
         # Settle window: stop latency / at-rest evidence.
         settle_until = time.time() + args.settle

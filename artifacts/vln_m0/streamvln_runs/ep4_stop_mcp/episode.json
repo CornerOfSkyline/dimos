@@ -1,0 +1,54 @@
+{
+  "episode_id": "streamvln_ep4_stop_mcp",
+  "policy": "streamvln",
+  "instruction": "Move forward past the chairs and stop in the open area.",
+  "started": "2026-11-17T12:05:49.082851+00:00",
+  "ended": "2026-11-17T12:06:07.842679+00:00",
+  "duration_s": 18.758,
+  "mcp_tool_output": "Stopped by stop_navigation or stop_movement.",
+  "skill_completion_line": {
+    "t": 1794917164.7737994,
+    "event": "SKILL stream_vln duration_ms=8213.0"
+  },
+  "termination_reason": "STOPPED_BY_USER",
+  "policy_turns": 5,
+  "server_actions_per_turn": [
+    "[2, 2, 2, 2]",
+    "[2, 2, 1, 1]",
+    "[1, 1, 1, 1]",
+    "[1, 1, 1, 1]",
+    "[1, 1, 1, 1]"
+  ],
+  "server_log_lines": [
+    "instruction: 'Move forward past the chairs and stop in the open area.'",
+    "init reset model!!!",
+    "!!!!!!!!!!!!!!!!!!!!!!!reset memory!!!!!!!!!!!!!!!!!!!!!!!",
+    "instruction: 'Move forward past the chairs and stop in the open area.'",
+    "instruction: 'Move forward past the chairs and stop in the open area.'",
+    "instruction: 'Move forward past the chairs and stop in the open area.'",
+    "instruction: 'Move forward past the chairs and stop in the open area.'"
+  ],
+  "instruction_reached_server": true,
+  "odom_before": {
+    "t": 1794917149.065117,
+    "x": -2.053663859110676,
+    "y": 1.6973661047533963,
+    "yaw_deg": -162.5330899931014
+  },
+  "odom_after": {
+    "t": 1794917167.840894,
+    "x": -1.0889101866557336,
+    "y": -0.6415016436607073,
+    "yaw_deg": -74.27839882593895
+  },
+  "distance_m": 2.53,
+  "stop": {
+    "requested_at_cli_launch": 1794917157.1266105,
+    "delivery": null,
+    "mode": "mcp_stop_stream_vln",
+    "cli_launch_to_last_nonzero_tele_cmd_vel_s": 1.414,
+    "cli_launch_to_last_nonzero_cmd_vel_s": 1.415,
+    "delivery_to_last_nonzero_tele_cmd_vel_s": null,
+    "target_lt_2s": true
+  }
+}

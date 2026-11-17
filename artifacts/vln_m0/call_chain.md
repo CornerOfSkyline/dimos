@@ -223,6 +223,7 @@ ActiveVLN 在每轮动作执行完后带新观测再次请求
 | PD 归位/卡死/odom 丢失/紧急停止（含零速收尾） | [已实现] 单元测试 | 同上（test_pd_drive_*） |
 | 服务器指令注入（打补丁副本） | [已实现]（与上游 diff 审查）| `streamvln-deploy/http_realworld_server.patch` |
 | 基本动作 odom 证据（0.25/0.50m、±15°、序列、停止延迟） | [已验证] | `basic_actions/steps.jsonl`、`basic_actions/summary.json` |
-| ActiveVLN 真实模型闭环 ≥3 次 | [运行时待验证] | `activevln_runs/` |
-| StreamVLN 真实模型闭环 ≥3 次（含服务器收到指令的日志证据） | [运行时待验证] | `streamvln_runs/` |
-| 停止 <2s（真实模型运行中） | [运行时待验证] | `streamvln_runs/` |
+| ActiveVLN 真实模型闭环 3 次（ep1 33 轮策略说停 / ep2 50 轮预算耗尽 / ep3 用户停止） | [已验证] | `activevln_runs/{ep1,ep2,ep3_stop}/episode.json` |
+| StreamVLN 真实模型闭环 4 次（ep1 8 轮 / ep2 10 轮 / ep3+ep4 用户停止；服务器日志证明每条指令到达） | [已验证] | `streamvln_runs/{ep1,ep2,ep3_stop,ep4_stop_mcp}/episode.json` |
+| 停止 <2s（真实模型运行中） | [已验证] 交付延迟→最后非零指令 ~20ms 级（log 时间戳）；端到端含 agent-send CLI 启动 ~1.3s < 2s | `streamvln_runs/ep3_stop`、`ep4_stop_mcp`、`activevln_runs/ep3_stop` 的 `episode.json:stop` |
+| MCP background 技能 120s RPC 超时误释放能力（M0-04 中发现并修复） | [已实现+已验证] | 提交 `9a405e2`；ep1 重跑 SKILL 行 285.8s 完整返回 |
