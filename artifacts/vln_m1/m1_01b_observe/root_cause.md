@@ -42,3 +42,20 @@ GATE 的 S5 用的是 `_GateGraph` 假执行器：`observe_call_artefact` 在**�
 - 指令形态：“往前走到红椅子前停下” → Agent 直接 `active_vln`，从不 observe——图像链路根本未被触碰
 - 无用户反馈“模型说看不到东西”——因为 Agent 未被要求描述视觉内容
 - `test_t05_verification_observe_after_vln_completion` 这类“任务完成后看图核验”流程在真实复测中未被执行（M0 时期的对应行为是 observe 后 artefact 回灌，属修复后恢复的能力）
+
+
+## 五、FOLLOWUP 追记（提交 83bf4a5）：OBSERVE 修复重新打开了重复运动之门
+
+**第一阶段真实链路复现**（`test_incident_rebuild.py`，仅 MCP HTTP/LLM 假件，零 ledger 手术）在 `edf8f9c` 上的实测时间线：
+
+```
+USER_COMMAND → active_vln(v1) → "Policy said stop."（COMPLETED）→ observe(c1)
+→ 图像入队 → 回合关闭 → 消费图像（进模型 ✓ OBSERVE 修复恢复的能力）
+→ 对抗性模型从图像回合发出 active_vln(v2) → 第二次运动真实发生（motion=2）
+```
+
+**结论：修复前（edf8f9c）允许第二次 active_vln。** 窗口门控无法关闭此门：重复执行的发起者是**消费图像的回合自身的模型决策**——距一张完全合法的图像仅一个回合。若靠丢弃图像来止动，等于重新破坏 observe（层级错误）。
+
+根因结构：OBSERVE 修复把"图像可见性"（第一层）恢复的同时，没有独立回答"产物回合是否有权**发起运动**"（第二层）——任务书 E 项的分离要求正是缺失的一环。
+
+修复后的同链路（对照证据，同一测试内断言）：`active_vln(v1) 执行一次 → 图像可见（artefact=1）→ 对抗性 v2 在工具层被结构化拒绝（MCP 层零调用）→ 拒绝文本回到模型可转述`。
