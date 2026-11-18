@@ -61,10 +61,10 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 # ActiveVLN's R2R action space (its eval/vlnce/eval_vlnce.py): forward in 25cm
-# steps, turns in 15-degree steps, up to 3 elementary actions per answer.
-FORWARD_STEP_M = 0.25
+# steps, turns in 15-degree steps. The prompt grammar allows up to 3
+# sub-actions per answer; the official executor caps each sub-action at 3
+# elementary steps (75 cm / 45 deg), which _parse_actions clamps to.
 TURN_STEP_DEG = 15.0
-MAX_ACTIONS_PER_TURN = 3
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant. "
@@ -152,12 +152,36 @@ def _image_to_data_url(image: Image, max_pixels: int) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _image_to_bgr_jpeg(image: Image, quality: int = 90) -> bytes:
+    """The camera frame as JPEG bytes with BGR channel order.
+
+    The official StreamVLN client (realworld/go2_vln_client.py) wraps the raw
+    cv_bridge 'bgr8' array with PIL and JPEG-encodes it as-is; the server
+    flips the channels back to RGB on arrival (streamvln/http_realworld_server.py:
+    np.asarray(image)[..., ::-1]). Encoding RGB here instead would reach the
+    model color-flipped, so the channel order is part of the wire protocol.
+    No downscale, like the official client: the server's image_processor
+    handles resizing.
+    """
+    from PIL import Image as PILImage
+
+    bgr = image.data if image.format == ImageFormat.BGR else image.data[..., ::-1]
+    pil = PILImage.fromarray(np.ascontiguousarray(bgr))
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
 def _parse_actions(text: str) -> list[tuple[int, float]]:
     """ActiveVLN's answer grammar: comma-separated actions with magnitudes.
 
     "turn left 15 degrees, move forward 50cm" -> [(_LEFT, 15.0), (_FORWARD, 50.0)].
     Text that names no action yields []: the caller re-asks with the same
-    observation instead of inventing a move.
+    observation instead of inventing a move. Every sub-action the answer names
+    is kept and clamped to the grammar's per-answer caps (75 cm forward,
+    45 degrees turn): the official executor (eval/vlnce/eval_vlnce.py,
+    extract_multi_result + act) runs all sub-actions and caps each at
+    min(3, magnitude/step) elementary steps — it never slices the list.
     """
     actions: list[tuple[int, float]] = []
     for part in re.split(r"[,;/]", text.lower()):
@@ -165,14 +189,17 @@ def _parse_actions(text: str) -> list[tuple[int, float]]:
             actions.append((_STOP, 0.0))
         elif "forward" in part:
             m = re.search(r"-?\d+", part)
-            actions.append((_FORWARD, float(m.group()) if m else 25.0))
+            magnitude = float(m.group()) if m else 25.0
+            actions.append((_FORWARD, min(magnitude, 0.75 * 100.0)))
         elif "left" in part:
             m = re.search(r"-?\d+", part)
-            actions.append((_LEFT, float(m.group()) if m else TURN_STEP_DEG))
+            magnitude = float(m.group()) if m else TURN_STEP_DEG
+            actions.append((_LEFT, min(magnitude, 3.0 * TURN_STEP_DEG)))
         elif "right" in part:
             m = re.search(r"-?\d+", part)
-            actions.append((_RIGHT, float(m.group()) if m else TURN_STEP_DEG))
-    return _coalesce(actions[:MAX_ACTIONS_PER_TURN])
+            magnitude = float(m.group()) if m else TURN_STEP_DEG
+            actions.append((_RIGHT, min(magnitude, 3.0 * TURN_STEP_DEG)))
+    return _coalesce(actions)
 
 
 def _coalesce(actions: list[tuple[int, float]]) -> list[tuple[int, float]]:
@@ -188,33 +215,40 @@ def _coalesce(actions: list[tuple[int, float]]) -> list[tuple[int, float]]:
     only the planner churn in between disappears.
 
     Turns keep their sign (left positive, right negative) so a left followed
-    by a right is a direction change and stays two goals. Forward caps at the
-    training grammar's 75cm; a turn sequence over 45 degrees splits at that
-    cap (the largest turn the checkpoints were trained to answer with).
+    by a right is a direction change and stays two goals. Merging is
+    lossless: a run longer than one goal's cap (75 cm forward, 45 degrees
+    turn — the grammar's per-answer maxima) splits at the cap into
+    consecutive goals, so no part of an action sequence is ever dropped.
+    (StreamVLN's 4-step batches reach 100 cm / 60 degrees; its official
+    client executes every returned action.)
     """
     merged: list[tuple[int, float]] = []
     for action_id, magnitude in actions:
         if merged and merged[-1][0] == action_id and action_id != _STOP:
             prev_id, prev_mag = merged[-1]
             if action_id == _FORWARD:
-                merged[-1] = (prev_id, min(prev_mag + magnitude, 0.75 * 100.0))
+                merged[-1] = (prev_id, prev_mag + magnitude)
             else:  # turns: left positive, right negative magnitude
                 sign = 1.0 if action_id == _LEFT else -1.0
                 merged[-1] = (prev_id, sign * (abs(prev_mag) + magnitude))
         else:
             merged.append((action_id, magnitude))
-    # Split any coalesced turn that grew past the grammar's 45-degree max.
+    # Split runs past one goal's cap into consecutive capped goals (lossless).
     capped: list[tuple[int, float]] = []
     for action_id, magnitude in merged:
-        if action_id in (_LEFT, _RIGHT) and abs(magnitude) > 45.0:
-            remaining = magnitude
-            while abs(remaining) > 45.0:
-                capped.append((action_id, 45.0 if remaining > 0 else -45.0))
-                remaining -= 45.0 if remaining > 0 else -45.0
-            if remaining != 0.0:
-                capped.append((action_id, remaining))
+        if action_id == _FORWARD:
+            cap = 0.75 * 100.0
+        elif action_id in (_LEFT, _RIGHT):
+            cap = 3.0 * TURN_STEP_DEG
         else:
             capped.append((action_id, magnitude))
+            continue
+        remaining = magnitude
+        while abs(remaining) > cap:
+            capped.append((action_id, cap if remaining > 0 else -cap))
+            remaining -= cap if remaining > 0 else -cap
+        if remaining != 0.0:
+            capped.append((action_id, remaining))
     return capped
 
 
@@ -260,7 +294,17 @@ class ActiveVlnSkill(Module):
 
     _latest_image: Image | None = None
     _latest_odom: PoseStamped | None = None
-    _running: threading.Event = threading.Event()
+    # Per-instance run state (assigned in __init__). A class-level default
+    # like `_running = threading.Event()` would share one Event object across
+    # every instance of the class — stopping one skill's run would stop them
+    # all, and two stacks in one process could never run at once.
+    _running: threading.Event
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._running = threading.Event()
+        # Held while one run drives the robot (active_vln is not reentrant).
+        self._run_lock = threading.Lock()
 
     @rpc
     def start(self) -> None:
@@ -339,7 +383,22 @@ class ActiveVlnSkill(Module):
         if not self._latest_image or not self._latest_odom:
             return "No camera or odometry data yet; cannot start active_vln."
 
-        self._running.set()
+        with self._run_lock:
+            if self._running.is_set():
+                return "An active_vln run is already in progress."
+            self._running.set()
+
+        try:
+            return self._run(instruction)
+        finally:
+            # Every exit path (returns inside _run included) releases the run.
+            self._running.clear()
+
+    def _run(self, instruction: str) -> str:
+        """The turn loop: ask the policy, execute its actions, until stop or
+        budget. Every exit path leaves the robot at rest (zero twist
+        published).
+        """
         client = self._client()
         conversations: list[dict[str, Any]] = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
@@ -347,21 +406,27 @@ class ActiveVlnSkill(Module):
 
         for turn in range(1, self.config.max_turns + 1):
             if not self._running.is_set():
+                self.tele_cmd_vel.publish(Twist.zero())
                 self._navigation.cancel_goal()
                 return "Stopped by stop_navigation or stop_movement."
 
             if self._latest_image is None:
+                self.tele_cmd_vel.publish(Twist.zero())
                 return "Camera stream stopped mid-run."
 
             first = len(conversations) == 1
             content = [
                 {
                     "type": "text",
-                    "text": "[Initial Observation]:" if first else "After that, the observation is:",
+                    "text": "[Initial Observation]:"
+                    if first
+                    else "After that, the observation is:",
                 },
                 {
                     "type": "image_url",
-                    "image_url": {"url": _image_to_data_url(self._latest_image, self.config.max_pixels)},
+                    "image_url": {
+                        "url": _image_to_data_url(self._latest_image, self.config.max_pixels)
+                    },
                 },
                 {"type": "text", "text": PROMPT_TEMPLATE.format(instruction=instruction)},
             ]
@@ -370,10 +435,12 @@ class ActiveVlnSkill(Module):
             try:
                 answer = self._chat(client, conversations)
             except Exception as e:
-                self._running.clear()
                 logger.error("ActiveVLN inference failed", exc_info=e)
+                self.tele_cmd_vel.publish(Twist.zero())
                 return f"Policy endpoint error: {e}"
-            conversations.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
+            conversations.append(
+                {"role": "assistant", "content": [{"type": "text", "text": answer}]}
+            )
             logger.info("ActiveVLN turn %d: %s", turn, answer)
 
             actions = _parse_actions(answer)
@@ -385,10 +452,9 @@ class ActiveVlnSkill(Module):
 
             for action_id, magnitude in actions:
                 if not self._running.is_set() or action_id == _STOP:
+                    self.tele_cmd_vel.publish(Twist.zero())
                     self._navigation.cancel_goal()
-                    reason = "Policy said stop." if action_id == _STOP else "Stopped."
-                    self._running.clear()
-                    return reason
+                    return "Policy said stop." if action_id == _STOP else "Stopped."
                 if not self._run_action(action_id, magnitude):
                     # The planner failed on this move; the next observation
                     # shows the unchanged view, and the policy re-decides.
@@ -399,7 +465,7 @@ class ActiveVlnSkill(Module):
                     )
                     break
 
-        self._running.clear()
+        self.tele_cmd_vel.publish(Twist.zero())
         return f"Turn budget ({self.config.max_turns}) spent; stopped where the robot is."
 
     def _run_action(self, action_id: int, magnitude: float) -> bool:
@@ -416,7 +482,7 @@ class ActiveVlnSkill(Module):
         if pose is None:
             return False
         if action_id == _FORWARD:
-            target = _relative_goal(pose, min(magnitude, 75.0) / 100.0, 0.0)
+            target = _relative_goal(pose, magnitude / 100.0, 0.0)
             return _pd_drive(self, target)
         # Turns carry their sign through _coalesce (left +, right -).
         degrees = magnitude if action_id == _LEFT else -abs(magnitude)
@@ -428,11 +494,22 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
     """PD velocity homing to *target* — the official deployment's controller.
 
     10 Hz loop: forward-axis and yaw errors from the odom to the target, PD
-    step (the deployment's gains), clamped velocities on tele_cmd_vel.
-    Completes — True — only when the driven errors are inside the done
-    thresholds, so the asked displacement happened by construction; no
-    planner arrival state to trust. False on stop (urgent stop clears the
-    running flag), odom loss, or timeout, always leaving a zero twist.
+    step (the deployment's gains) damped by the MEASURED velocity — the
+    official controller's own term (realworld/pid_controller.py solves with
+    the robot's reported [v, w]; damping on the last commanded value instead
+    underdamps any plant that tracks faster than commanded) — clamped
+    velocities on tele_cmd_vel. Completes — True — only when the driven
+    errors are inside the done thresholds, so the asked displacement
+    happened by construction; no planner arrival state to trust. False on
+    stop (urgent stop clears the running flag), odom loss, or timeout,
+    always leaving a zero twist.
+
+    The command rate is part of the stability story on plants that track
+    faster than commanded: the MuJoCo Go2 runs ~2-5x the commanded rate
+    (measured live), so at the default 10 Hz the per-cycle loop gain sits
+    near 1 and turns relay-oscillate (30 s timeouts observed live); the sim
+    stack configures drive_hz=50, where the loop is comfortably stable.
+    Real hardware with tight velocity tracking runs the official 10 Hz.
 
     *turn_only* (turn-in-place goals) drives the yaw loop alone: a quadruped
     turning in place drifts positionally, and correcting that drift makes the
@@ -451,16 +528,30 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
     done_rad = math.radians(cfg.done_deg)
     dt = 1.0 / cfg.drive_hz
     deadline = time.monotonic() + cfg.step_timeout
-    prev_v = 0.0
-    prev_w = 0.0
     stuck_since: float | None = None
     reference = skill._latest_odom
     target_yaw = target.orientation.to_euler().yaw
+    prev_pose = skill._latest_odom
+    prev_t = time.monotonic()
     while time.monotonic() < deadline and skill._running.is_set():
         pose = skill._latest_odom
         if pose is None:
             break
+        now = time.monotonic()
         yaw = pose.orientation.to_euler().yaw
+        # Measured velocity (finite differences on the odom between cycles) —
+        # the official controller's damping term. Zero when the odom stands
+        # still between cycles (or is a fresh equal pose).
+        v_meas, w_meas = 0.0, 0.0
+        if prev_pose is not None and pose is not prev_pose:
+            dt_meas = now - prev_t
+            if dt_meas > 1e-3:
+                prev_yaw = prev_pose.orientation.to_euler().yaw
+                dx = pose.position.x - prev_pose.position.x
+                dy = pose.position.y - prev_pose.position.y
+                v_meas = (dx * math.cos(prev_yaw) + dy * math.sin(prev_yaw)) / dt_meas
+                w_meas = ((yaw - prev_yaw + math.pi) % (2 * math.pi) - math.pi) / dt_meas
+        prev_pose, prev_t = pose, now
         e_r = (target_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
         if turn_only:
             if abs(e_r) <= done_rad:
@@ -474,7 +565,7 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
             if abs(e_p) <= cfg.done_m and abs(e_r) <= done_rad:
                 skill.tele_cmd_vel.publish(Twist.zero())
                 return True
-            v = cfg.kp_trans * max(-1.0, min(1.0, e_p)) - cfg.kd_trans * prev_v
+            v = cfg.kp_trans * max(-1.0, min(1.0, e_p)) - cfg.kd_trans * v_meas
             v = max(-cfg.max_v, min(cfg.max_v, v))
             # Blocked detection: commanding real speed but covering no ground.
             if reference is not None and abs(v) > 0.1:
@@ -492,12 +583,9 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
                 else:
                     stuck_since = None
                 reference = pose
-        w = cfg.kp_yaw * max(-1.0, min(1.0, e_r)) - cfg.kd_yaw * prev_w
+        w = cfg.kp_yaw * max(-1.0, min(1.0, e_r)) - cfg.kd_yaw * w_meas
         w = max(-cfg.max_w, min(cfg.max_w, w))
-        skill.tele_cmd_vel.publish(
-            Twist(linear=Vector3(v, 0.0, 0.0), angular=Vector3(0.0, 0.0, w))
-        )
-        prev_v, prev_w = v, w
+        skill.tele_cmd_vel.publish(Twist(linear=Vector3(v, 0.0, 0.0), angular=Vector3(0.0, 0.0, w)))
         time.sleep(dt)
     skill.tele_cmd_vel.publish(Twist.zero())
     return False

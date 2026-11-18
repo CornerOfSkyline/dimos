@@ -79,7 +79,7 @@ export LD_LIBRARY_PATH="$WS/libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # through the `speak` skill (TTS, needs OPENAI_API_KEY) which fails in a loop.
 SYSTEM_PROMPT="${DIMOS_SYSTEM_PROMPT:-You are a Unitree Go2 robot assistant in a web cockpit. The user chats with you in a chat panel: always reply with plain text in your message content directly. NEVER use the speak skill - it has no TTS configured and always fails. Keep replies concise (1-3 sentences). Skills: active_vln (instruction-following routes by camera, e.g. 'walk past the desk and stop by the sofa'), begin_exploration, end_exploration, navigate_with_text, stop_navigation, move_to, observe, look_out_for, stop_looking_out, follow_person, stop_following, tag_location, start_patrol, stop_patrol, get_battery_soc, wait, current_time. Prefer active_vln for routes described in natural language; navigate_with_text for known places or objects.}"
 
-BLUEPRINT=unitree-go2-agentic-activevln
+BLUEPRINT=unitree-go2-agentic-vln
 if [ "${WITH_COCKPIT:-0}" = "1" ]; then
     BLUEPRINT=unitree-go2-agentic-activevln-cockpit
     CERTS="$WS/certs"
@@ -99,11 +99,16 @@ if [ "${WITH_COCKPIT:-0}" = "1" ]; then
         sleep 4
     fi
     echo "==> cockpit: https://$LAN_IP:7780 (viewer token in $CERTS/relay-auth.json)"
+    # drive-hz 50: the MuJoCo Go2 tracks ~2-5x the commanded rate, so the
+    # real-robot 10 Hz PD rate sits at a per-cycle loop gain near 1 and turns
+    # relay-oscillate (30 s timeouts measured); 50 Hz is comfortably stable
+    # (all 6 basic-motion cases pass — artifacts/vln_m0/basic_actions).
     exec "$REPO/.venv/bin/dimos" --simulation run "$BLUEPRINT" \
         --agent.model "${OLLAMA_MODEL:-ollama:qwen3-vl:32b}" \
         --agent.system-prompt "$SYSTEM_PROMPT" \
         --activevlnskill.base-url "http://localhost:$PORT/v1" \
         --activevlnskill.model activevln \
+        --activevlnskill.drive-hz 50 \
         --listen-host 0.0.0.0 \
         --relay-url "https://$LAN_IP:7780" \
         --dynamicrelaybridge_940788bb41.relay-ca "$CERTS/dimos-relay-ca.pem" \
@@ -118,6 +123,7 @@ exec "$REPO/.venv/bin/dimos" --simulation run "$BLUEPRINT" \
     --agent.system-prompt "$SYSTEM_PROMPT" \
     --activevlnskill.base-url "http://localhost:$PORT/v1" \
     --activevlnskill.model activevln \
+    --activevlnskill.drive-hz 50 \
     --rerunbridgemodule.rerun-open web \
     --listen-host "${LISTEN_HOST:-127.0.0.1}" \
     "$@"

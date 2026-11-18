@@ -18,6 +18,12 @@ DEFAULT_MCP_PORT = 9990
 DEFAULT_MCP_TIMEOUT = 30
 DEFAULT_MCP_URL = f"http://localhost:{DEFAULT_MCP_PORT}/mcp"
 
+# The MCP server's worker RPC timeout for background skills (their worker
+# call runs as long as the task — VLN episodes run for minutes; the default
+# 120 s RPC timeout would fire mid-run and release the capability token
+# while the worker still drives the robot).
+BACKGROUND_SKILL_RPC_TIMEOUT = 24 * 3600.0
+
 # `HumanMessage.additional_kwargs` key naming the tool a message on Agent's
 # `agent` stream came from. A tool's image result is fed to the model as a user
 # turn (a tool response cannot carry images for OpenAI models), and chat UIs read

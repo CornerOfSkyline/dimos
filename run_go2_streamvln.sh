@@ -4,11 +4,14 @@
 #
 # StreamVLN (https://github.com/InternRobotics/StreamVLN, ICRA 2026) serves
 # its SlowFast policy over the official real-world HTTP server
-# (streamvln/http_realworld_server.py): POST a JPEG frame -> discrete action
-# sequence (0 stop / 1 forward 25cm / 2 left 15deg / 3 right 15deg). The
-# server keeps the streaming context (memory tokens, every-4-steps inference)
-# internally; dimos's stream_vln skill is a plain HTTP client with the same
-# odom-verified execution as active_vln.
+# (streamvln/http_realworld_server.py): POST a BGR JPEG frame + the
+# instruction + a reset flag -> discrete action sequence (0 stop / 1 forward
+# 25cm / 2 left 15deg / 3 right 15deg; up to 4 per answer). This workspace
+# runs the PATCHED deployment copy (streamvln-deploy/http_realworld_server.py
+# — instruction passthrough; see streamvln-deploy/README.md and the .patch).
+# The server keeps the streaming context (memory tokens, every-4-steps
+# inference) internally; dimos's stream_vln skill is a plain HTTP client with
+# the same odom-verified execution as active_vln.
 #
 # One-time setup (NOT handled by this script):
 #   - checkpoint: HF_ENDPOINT=https://hf-mirror.com .venv/bin/python -c "
@@ -45,17 +48,17 @@ if ! "$SV/bin/python" -c "import transformers, flask" >/dev/null 2>&1; then
         2>&1 | tail -2
 fi
 
-# 3. the server (idempotent). NOTE: the official server hardcodes port 5801
-#    in app.run; --port is not a real flag of it.
+# 3. the server (idempotent) — the patched deployment copy in this workspace
+#    (instruction passthrough; streamvln-deploy/README.md). NOTE: the server
+#    hardcodes port 5801 in app.run; --port is not a real flag of it.
 if ! ss -tln 2>/dev/null | grep -q ":$PORT "; then
-    cd "$SVLN_REPO"
-    cd "$SVLN_REPO/streamvln"
-    HF_HUB_OFFLINE=1 HF_HOME="$HOME/.cache/huggingface" CUDA_VISIBLE_DEVICES=$GPU \
-    nohup "$SV/bin/python" http_realworld_server.py \
+    cd "$SVLN_REPO/streamvln"   # CWD: the server writes runs*/ annotated frames here
+    STREAMVLN_CODE_ROOT="$SVLN_REPO" HF_HUB_OFFLINE=1 HF_HOME="$HOME/.cache/huggingface" CUDA_VISIBLE_DEVICES=$GPU \
+    nohup "$SV/bin/python" "$WS/streamvln-deploy/http_realworld_server.py" \
         --model_path "$MODEL" \
         --device "cuda:0" \
         > /tmp/streamvln_server.log 2>&1 &
-    echo "==> StreamVLN server starting on GPU $GPU, :$PORT (model load takes a while)"
+    echo "==> StreamVLN server (patched copy) starting on GPU $GPU, :$PORT (model load takes a while)"
     cd "$REPO"
 fi
 # NOTE: the official server hardcodes 0.0.0.0:5801; SVLN_PORT other than 5801
@@ -92,11 +95,16 @@ if ! ss -tln 2>/dev/null | grep -q ":7780 "; then
 fi
 
 echo "==> cockpit: https://$LAN_IP:7780 | stream_vln skill -> http://localhost:$PORT/eval_vln"
+# drive-hz 50: the MuJoCo Go2 tracks ~2-5x the commanded rate, so the
+# real-robot 10 Hz PD rate sits at a per-cycle loop gain near 1 and turns
+# relay-oscillate (30 s timeouts measured); 50 Hz is comfortably stable
+# (all 6 basic-motion cases pass — artifacts/vln_m0/basic_actions).
 exec "$REPO/.venv/bin/dimos" --simulation run unitree-go2-agentic-activevln-cockpit \
     --vln-policy streamvln \
     --agent.model "${OLLAMA_MODEL:-ollama:qwen3-vl:32b}" \
     --agent.system-prompt "$SYSTEM_PROMPT" \
     --streamvlnskill.server-url "http://localhost:$PORT/eval_vln" \
+    --streamvlnskill.drive-hz 50 \
     --listen-host 0.0.0.0 \
     --relay-url "https://$LAN_IP:7780" \
     --dynamicrelaybridge_940788bb41.relay-ca "$CERTS/dimos-relay-ca.pem" \

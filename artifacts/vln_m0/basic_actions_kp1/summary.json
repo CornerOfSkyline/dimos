@@ -1,0 +1,8 @@
+{
+  "ts": "2026-11-17T11:38:53.942367+00:00",
+  "cases": 6,
+  "passed": 1,
+  "failed": 5,
+  "controller": "active_vln.skill._pd_drive (PD velocity homing, deployment constants)",
+  "pass": false
+}

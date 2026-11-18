@@ -39,6 +39,7 @@ class RpcCall:
     _remote_name: str
     _unsub_fns: list  # type: ignore[type-arg]
     _stop_rpc_client: Callable[[], None] | None = None
+    _rpc_timeout: float | None = None
 
     def __init__(
         self,
@@ -48,12 +49,14 @@ class RpcCall:
         remote_name: str,
         unsub_fns: list,  # type: ignore[type-arg]
         stop_client: Callable[[], None] | None = None,
+        rpc_timeout: float | None = None,
     ) -> None:
         self._rpc = rpc
         self._name = name
         self._remote_name = remote_name
         self._unsub_fns = unsub_fns
         self._stop_rpc_client = stop_client
+        self._rpc_timeout = rpc_timeout
 
         self.__name__ = name
         self.__qualname__ = f"{self.__class__.__name__}.{name}"
@@ -91,7 +94,11 @@ class RpcCall:
                 self._stop_rpc_client()
             return None
 
-        result, unsub_fn = self._rpc.call_sync(f"{self._remote_name}/{self._name}", (args, kwargs))
+        result, unsub_fn = self._rpc.call_sync(
+            f"{self._remote_name}/{self._name}",
+            (args, kwargs),
+            rpc_timeout=self._rpc_timeout,
+        )
         self._unsub_fns.append(unsub_fn)
         return result
 

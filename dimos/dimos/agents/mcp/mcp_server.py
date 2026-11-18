@@ -33,7 +33,11 @@ import uvicorn
 from dimos.agents.annotation import skill
 from dimos.agents.capabilities import CapabilityRegistry
 from dimos.agents.mcp import tool_stream
-from dimos.agents.mcp.constants import DEFAULT_MCP_PORT, mcp_url
+from dimos.agents.mcp.constants import (
+    BACKGROUND_SKILL_RPC_TIMEOUT,
+    DEFAULT_MCP_PORT,
+    mcp_url,
+)
 from dimos.agents.skill_result import SkillResult
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
@@ -481,7 +485,19 @@ class McpServer(Module):
         app.state.skills_by_name = {s.func_name: s for s in app.state.skills}
         app.state.rpc_calls = {
             skill_info.func_name: RpcCall(
-                None, self.rpc, skill_info.func_name, skill_info.class_name, []
+                None,
+                self.rpc,
+                skill_info.func_name,
+                skill_info.class_name,
+                [],
+                # A background skill's worker call runs as long as the task
+                # (VLN episodes: minutes). The default 120 s RPC timeout
+                # would fire mid-run, return a spurious error to the caller,
+                # and release the capability token while the worker still
+                # drives the robot. Instant skills keep the default.
+                rpc_timeout=BACKGROUND_SKILL_RPC_TIMEOUT
+                if skill_info.lifecycle == "background"
+                else None,
             )
             for skill_info in app.state.skills
         }
