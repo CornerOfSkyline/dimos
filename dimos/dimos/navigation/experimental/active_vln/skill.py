@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import math
 import re
 import threading
@@ -55,6 +56,23 @@ from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3, make_vector3
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
+from dimos.navigation.experimental.vln_task import (
+    ACTION_EXECUTION,
+    CANCELLED,
+    COMPLETED,
+    EXECUTION_ERROR,
+    FAILED,
+    INFERENCE,
+    POLICY_ERROR,
+    POLICY_STOP,
+    SENSOR_UNAVAILABLE,
+    STOPPING_STAGE,
+    TURN_BUDGET_EXHAUSTED,
+    USER_CANCELLED,
+    WAITING_OBSERVATION,
+    VlnRunHandle,
+    VlnTaskRuntime,
+)
 from dimos.navigation.go2.replanning_a_star.spec import NavigationInterfaceSpec
 from dimos.utils.logging_config import setup_logger
 
@@ -299,12 +317,12 @@ class ActiveVlnSkill(Module):
     # every instance of the class — stopping one skill's run would stop them
     # all, and two stacks in one process could never run at once.
     _running: threading.Event
+    _runtime: VlnTaskRuntime
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._running = threading.Event()
-        # Held while one run drives the robot (active_vln is not reentrant).
-        self._run_lock = threading.Lock()
+        self._runtime = VlnTaskRuntime("active_vln")
 
     @rpc
     def start(self) -> None:
@@ -315,8 +333,14 @@ class ActiveVlnSkill(Module):
 
     @rpc
     def stop(self) -> None:
+        self._runtime.request_cancel()  # the run's own handle event
         self._running.clear()
         self.tele_cmd_vel.publish(Twist.zero())
+        # Close the tool-stream on graceful module/worker shutdown so the
+        # capability registry learns the hold is gone (the tool_stopped
+        # frame); a hard crash still leaks until takeover/timeout — see
+        # vln_task.py and artifacts/vln_m1/m1_01/design.md.
+        self.stop_tool("active_vln")
         super().stop()
 
     @skill(uses=[CAP_MOVEMENT])
@@ -327,6 +351,7 @@ class ActiveVlnSkill(Module):
         (its conversation history is per-instruction anyway).
         """
 
+        self._runtime.request_cancel()  # the run's own handle event
         self._running.clear()
         self.tele_cmd_vel.publish(Twist.zero())
         self._navigation.cancel_goal()
@@ -337,6 +362,31 @@ class ActiveVlnSkill(Module):
 
     def _on_odom(self, odom: PoseStamped) -> None:
         self._latest_odom = odom
+
+    @skill
+    def get_vln_task_status(self, run_id: str | None = None) -> str:
+        """Get the status of a VLN task run (active_vln policy).
+
+        Returns the run's lifecycle state (CREATED/RUNNING/STOPPING/
+        COMPLETED/FAILED/CANCELLED), the current turn and execution stage,
+        timestamps, and — for finished runs — the termination reason
+        (POLICY_STOP, TURN_BUDGET_EXHAUSTED, USER_CANCELLED, POLICY_ERROR,
+        SENSOR_UNAVAILABLE, EXECUTION_ERROR). COMPLETED means the run ended
+        normally, NOT that the goal was reached. Without run_id: the most
+        recent run. Runs are queryable while executing and after they end;
+        a live state that stopped updating is flagged with stale_s. This
+        read does not use any capability and never touches motion control.
+
+        Args:
+            run_id: the run to look up; None for the most recent one.
+
+        Returns:
+            str: the task snapshot as JSON.
+        """
+        snapshot = self._runtime.snapshot(run_id)
+        if snapshot is None:
+            return json.dumps({"error": f"no active_vln task run {run_id!r}"})
+        return json.dumps(snapshot.as_dict())
 
     # -- policy client ------------------------------------------------------
 
@@ -383,35 +433,57 @@ class ActiveVlnSkill(Module):
         if not self._latest_image or not self._latest_odom:
             return "No camera or odometry data yet; cannot start active_vln."
 
-        with self._run_lock:
-            if self._running.is_set():
-                return "An active_vln run is already in progress."
-            self._running.set()
+        handle = self._runtime.begin(instruction, self.config.max_turns)
+        if handle is None:
+            state = self._runtime.current_state()
+            return (
+                f"An active_vln run is already in progress (run_id="
+                f"{self._runtime.current_run_id()}, state={state}). "
+                "It keeps its motion authority until it has fully stopped; "
+                "call stop_active_vln or wait for it to finish."
+            )
 
+        # Open (or re-stamp, on a same-tool MCP takeover) the tool-stream
+        # BEFORE anything else, so the movement hold is always carried by a
+        # live stream — the tool_stopped frame on close is what releases
+        # CAP_MOVEMENT at the McpServer (see Module.start_tool).
+        self.start_tool("active_vln")
+        self._running.set()
+        self._runtime.mark_running(handle)
         try:
-            return self._run(instruction)
+            return self._run(instruction, handle)
+        except Exception as e:  # unexpected: settle the task, keep the robot safe
+            logger.exception("active_vln run crashed")
+            handle.finish(FAILED, EXECUTION_ERROR, repr(e))
+            return f"active_vln run failed unexpectedly ({type(e).__name__}); stopped."
         finally:
-            # Every exit path (returns inside _run included) releases the run.
+            # Every exit path: robot at rest, goal cancelled, capability
+            # released via the stream close, run state settled by _run.
+            self.tele_cmd_vel.publish(Twist.zero())
+            self._navigation.cancel_goal()
+            self.stop_tool("active_vln")
             self._running.clear()
 
-    def _run(self, instruction: str) -> str:
+    def _run(self, instruction: str, handle: VlnRunHandle) -> str:
         """The turn loop: ask the policy, execute its actions, until stop or
-        budget. Every exit path leaves the robot at rest (zero twist
-        published).
+        budget. All state transitions report through this run's handle —
+        never through shared flags — so a policy answer that arrives after
+        the run was cancelled is dropped, not executed (the handle's cancel
+        event is checked before any action and inside every PD cycle).
         """
         client = self._client()
         conversations: list[dict[str, Any]] = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
         ]
 
-        for turn in range(1, self.config.max_turns + 1):
-            if not self._running.is_set():
-                self.tele_cmd_vel.publish(Twist.zero())
-                self._navigation.cancel_goal()
-                return "Stopped by stop_navigation or stop_movement."
+        for turn in range(1, handle.max_turns + 1):
+            if handle.cancelled:
+                self._runtime.set_stage(handle, STOPPING_STAGE, turn)
+                handle.finish(CANCELLED, USER_CANCELLED)
+                return "Stopped by stop_active_vln, stop_navigation or stop_movement."
 
             if self._latest_image is None:
-                self.tele_cmd_vel.publish(Twist.zero())
+                handle.finish(FAILED, SENSOR_UNAVAILABLE, "camera stream stopped mid-run")
                 return "Camera stream stopped mid-run."
 
             first = len(conversations) == 1
@@ -432,30 +504,44 @@ class ActiveVlnSkill(Module):
             ]
             conversations.append({"role": "user", "content": content})
 
+            self._runtime.set_stage(handle, INFERENCE, turn)
             try:
                 answer = self._chat(client, conversations)
             except Exception as e:
                 logger.error("ActiveVLN inference failed", exc_info=e)
-                self.tele_cmd_vel.publish(Twist.zero())
+                handle.finish(FAILED, POLICY_ERROR, repr(e))
                 return f"Policy endpoint error: {e}"
             conversations.append(
                 {"role": "assistant", "content": [{"type": "text", "text": answer}]}
             )
             logger.info("ActiveVLN turn %d: %s", turn, answer)
+            # A cancelled run's in-flight inference answer is stale by
+            # definition: drop it instead of acting on it.
+            if handle.cancelled:
+                self._runtime.set_stage(handle, STOPPING_STAGE, turn)
+                handle.finish(CANCELLED, USER_CANCELLED)
+                return "Stopped by stop_active_vln, stop_navigation or stop_movement."
 
             actions = _parse_actions(answer)
             if not actions:
                 # Unparseable answer: ask again with a fresh observation
                 # rather than moving blindly (the policy never saw this
                 # question answered with silence during training).
+                self._runtime.set_stage(handle, WAITING_OBSERVATION, turn)
                 continue
 
+            self._runtime.set_stage(handle, ACTION_EXECUTION, turn)
+            self.tool_update(
+                "active_vln", f"turn {turn}/{handle.max_turns}: {len(actions)} actions"
+            )
             for action_id, magnitude in actions:
-                if not self._running.is_set() or action_id == _STOP:
-                    self.tele_cmd_vel.publish(Twist.zero())
-                    self._navigation.cancel_goal()
-                    return "Policy said stop." if action_id == _STOP else "Stopped."
-                if not self._run_action(action_id, magnitude):
+                if handle.cancelled or action_id == _STOP:
+                    if action_id == _STOP:
+                        handle.finish(COMPLETED, POLICY_STOP)
+                        return "Policy said stop."
+                    handle.finish(CANCELLED, USER_CANCELLED)
+                    return "Stopped by stop_active_vln, stop_navigation or stop_movement."
+                if not self._run_action(action_id, magnitude, handle):
                     # The planner failed on this move; the next observation
                     # shows the unchanged view, and the policy re-decides.
                     logger.info(
@@ -463,12 +549,15 @@ class ActiveVlnSkill(Module):
                         _ACTION_NAMES[action_id],
                         magnitude,
                     )
+                    self._runtime.set_stage(handle, WAITING_OBSERVATION, turn)
                     break
 
-        self.tele_cmd_vel.publish(Twist.zero())
-        return f"Turn budget ({self.config.max_turns}) spent; stopped where the robot is."
+        handle.finish(COMPLETED, TURN_BUDGET_EXHAUSTED)
+        return f"Turn budget ({handle.max_turns}) spent; stopped where the robot is."
 
-    def _run_action(self, action_id: int, magnitude: float) -> bool:
+    def _run_action(
+        self, action_id: int, magnitude: float, handle: VlnRunHandle | None = None
+    ) -> bool:
         """One coalesced action as a PD velocity homing run; True when done.
 
         The VLN's actions are tiny position deltas (25 cm / 15 deg) — at or
@@ -476,21 +565,29 @@ class ActiveVlnSkill(Module):
         accept such goals as reached before the robot has moved. The official
         StreamVLN real-world deployment instead drives the incremental goals
         with a PD velocity controller (its realworld/pid_controller.py);
-        this is that controller, on tele_cmd_vel.
+        this is that controller, on tele_cmd_vel. The run's cancel event is
+        threaded through so a stop mid-drive unblocks the PD loop within one
+        cycle.
         """
         pose = self._latest_odom
         if pose is None:
             return False
+        cancel = handle.cancel if handle is not None else None
         if action_id == _FORWARD:
             target = _relative_goal(pose, magnitude / 100.0, 0.0)
-            return _pd_drive(self, target)
+            return _pd_drive(self, target, cancel=cancel)
         # Turns carry their sign through _coalesce (left +, right -).
         degrees = magnitude if action_id == _LEFT else -abs(magnitude)
         target = _relative_goal(pose, 0.0, degrees)
-        return _pd_drive(self, target, turn_only=True)
+        return _pd_drive(self, target, turn_only=True, cancel=cancel)
 
 
-def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool = False) -> bool:
+def _pd_drive(
+    skill: ActiveVlnSkill | Any,
+    target: PoseStamped,
+    turn_only: bool = False,
+    cancel: threading.Event | None = None,
+) -> bool:
     """PD velocity homing to *target* — the official deployment's controller.
 
     10 Hz loop: forward-axis and yaw errors from the odom to the target, PD
@@ -533,7 +630,13 @@ def _pd_drive(skill: ActiveVlnSkill | Any, target: PoseStamped, turn_only: bool 
     target_yaw = target.orientation.to_euler().yaw
     prev_pose = skill._latest_odom
     prev_t = time.monotonic()
-    while time.monotonic() < deadline and skill._running.is_set():
+
+    def _cancelled() -> bool:
+        # The run's own cancel event (preferred); the skill-wide _running
+        # flag keeps the pre-lifecycle callers and the M0 unit tests working.
+        return cancel.is_set() if cancel is not None else not skill._running.is_set()
+
+    while time.monotonic() < deadline and not _cancelled():
         pose = skill._latest_odom
         if pose is None:
             break

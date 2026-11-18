@@ -54,6 +54,7 @@ from dimos.navigation.experimental.active_vln.skill import (
     _pd_drive,
     _relative_goal,
 )
+from dimos.navigation.experimental.vln_task import VlnTaskRuntime
 
 
 def _pose(x: float, y: float, yaw_deg: float) -> PoseStamped:
@@ -251,15 +252,22 @@ def _sim_skill(**cfg: Any) -> tuple[ActiveVlnSkill, _SimTele]:
 
     __new__ skips Module.__init__ (which opens real transports); the driving
     code only reads the attributes set here. This is also why run state
-    living on the class (not __init__) was a real cross-instance bug.
+    living on the class (not __init__) was a real cross-instance bug. The
+    tool-stream trio is faked with recorders for lifecycle assertions.
     """
     skill = ActiveVlnSkill.__new__(ActiveVlnSkill)
     skill.config = ActiveVlnConfig(step_timeout=5.0, **cfg)
     skill._running = threading.Event()
     skill._running.set()
-    skill._run_lock = threading.Lock()
+    skill._runtime = VlnTaskRuntime("active_vln")
     skill._latest_odom = _pose(0.0, 0.0, 0.0)
     skill.tele_cmd_vel = _SimTele(skill)
+    skill.tools_opened: list[str] = []
+    skill.tools_closed: list[str] = []
+    skill.tool_updates: list[Any] = []
+    skill.start_tool = lambda name: skill.tools_opened.append(name)  # type: ignore[method-assign]
+    skill.stop_tool = lambda name: skill.tools_closed.append(name)  # type: ignore[method-assign]
+    skill.tool_update = lambda name, msg: skill.tool_updates.append((name, msg))  # type: ignore[method-assign]
     return skill, skill.tele_cmd_vel
 
 
@@ -396,7 +404,7 @@ def _chat_skill(answers: list[str]) -> tuple[ActiveVlnSkill, list[Any], list[tup
         captured.append(list(messages))  # snapshot: the skill mutates it per turn
         return remaining.pop(0)
 
-    def fake_run_action(action_id: int, magnitude: float) -> bool:
+    def fake_run_action(action_id: int, magnitude: float, handle: Any = None) -> bool:
         executed.append((action_id, magnitude))
         return True
 
@@ -432,7 +440,7 @@ def test_camera_loss_mid_run_releases_the_run_state() -> None:
     # the try/finally: the next active_vln call would think one is running).
     skill, captured, executed = _chat_skill(["turn left 15 degrees", "stop"])
 
-    def fake_run_action(action_id: int, magnitude: float) -> bool:
+    def fake_run_action(action_id: int, magnitude: float, handle: Any = None) -> bool:
         executed.append((action_id, magnitude))
         skill._latest_image = None  # camera drops after the first move
         return True

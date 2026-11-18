@@ -51,6 +51,7 @@ from dimos.navigation.experimental.stream_vln.skill import (
     StreamVlnSkill,
     _parse_server_actions,
 )
+from dimos.navigation.experimental.vln_task import VlnTaskRuntime
 
 
 def _red_bgr_image() -> Image:
@@ -112,13 +113,14 @@ def _skill(scripted_answers: list[Any], executed: list[tuple[int, float]]) -> St
 
     __new__ skips Module.__init__ (which opens real transports); the run loop
     only reads the attributes set here (its own _execute is replaced by a
-    recorder — the shared PD homing has its own tests in active_vln).
+    recorder — the shared PD homing has its own tests in active_vln). The
+    tool-stream trio (start_tool/tool_update/stop_tool) is faked with
+    recorders so lifecycle tests can assert on the stream open/close order.
     """
     skill = StreamVlnSkill.__new__(StreamVlnSkill)
     skill.config = StreamVlnConfig(max_turns=5, request_timeout=1.0)
-    skill._running = threading.Event()
-    skill._running.set()
-    skill._run_lock = threading.Lock()
+    skill._running = threading.Event()  # the public entry sets it itself
+    skill._runtime = VlnTaskRuntime("stream_vln")
     skill._latest_image = _red_bgr_image()
     skill._latest_odom = object()  # opaque: _execute is replaced below
 
@@ -137,8 +139,14 @@ def _skill(scripted_answers: list[Any], executed: list[tuple[int, float]]) -> St
 
     skill.tele_cmd_vel = _Tele()
     skill._navigation = _Nav()
+    skill.tools_opened: list[str] = []
+    skill.tools_closed: list[str] = []
+    skill.tool_updates: list[str] = []
+    skill.start_tool = lambda name: skill.tools_opened.append(name)  # type: ignore[method-assign]
+    skill.stop_tool = lambda name: skill.tools_closed.append(name)  # type: ignore[method-assign]
+    skill.tool_update = lambda name, msg: skill.tool_updates.append((name, msg))  # type: ignore[method-assign]
 
-    def fake_execute(action_id: int, magnitude: float) -> bool:
+    def fake_execute(action_id: int, magnitude: float, handle: Any = None) -> bool:
         executed.append((action_id, magnitude))
         return True
 
@@ -171,7 +179,7 @@ def test_reset_instruction_and_bgr_frame_reach_the_wire(monkeypatch: Any) -> Non
     executed: list[tuple[int, float]] = []
     skill = _skill([], executed)
 
-    result = StreamVlnSkill._run(skill, "walk to the sofa")
+    result = StreamVlnSkill.stream_vln(skill, "walk to the sofa")
 
     assert result == "Policy said stop."
     # All four returned actions were consumed (coalesced, lossless).
@@ -199,7 +207,7 @@ def test_invalid_answer_is_rejected_without_moving(monkeypatch: Any) -> None:
     executed: list[tuple[int, float]] = []
     skill = _skill([], executed)
 
-    result = StreamVlnSkill._run(skill, "walk to the sofa")
+    result = StreamVlnSkill.stream_vln(skill, "walk to the sofa")
 
     assert result.startswith("Rejected the policy's action answer")
     assert executed == []  # nothing moved
@@ -213,7 +221,7 @@ def test_server_unreachable_stops_at_rest(monkeypatch: Any) -> None:
     executed: list[tuple[int, float]] = []
     skill = _skill([], executed)
 
-    result = StreamVlnSkill._run(skill, "walk to the sofa")
+    result = StreamVlnSkill.stream_vln(skill, "walk to the sofa")
 
     assert result == "Policy server unreachable; stopped where the robot is."
     assert executed == []
@@ -226,7 +234,7 @@ def test_empty_answer_reposts_without_moving(monkeypatch: Any) -> None:
     executed: list[tuple[int, float]] = []
     skill = _skill([], executed)
 
-    result = StreamVlnSkill._run(skill, "walk to the sofa")
+    result = StreamVlnSkill.stream_vln(skill, "walk to the sofa")
 
     assert result == "Policy said stop."
     assert executed == []
@@ -239,12 +247,12 @@ def test_blocked_move_lets_the_policy_re_decide(monkeypatch: Any) -> None:
     executed: list[tuple[int, float]] = []
     skill = _skill([], executed)
 
-    def blocked_execute(action_id: int, magnitude: float) -> bool:
+    def blocked_execute(action_id: int, magnitude: float, handle: Any = None) -> bool:
         executed.append((action_id, magnitude))
         return False  # the drive gave up (obstacle): policy re-decides
 
     skill._execute = blocked_execute  # type: ignore[method-assign]
-    result = StreamVlnSkill._run(skill, "walk to the sofa")
+    result = StreamVlnSkill.stream_vln(skill, "walk to the sofa")
 
     assert result == "Policy said stop."
     assert executed == [(_FORWARD, 25.0)]  # the blocked move, then a fresh frame
@@ -259,18 +267,19 @@ def test_stop_mid_run_interrupts_execution(monkeypatch: Any) -> None:
     executed: list[tuple[int, float]] = []
     skill = _skill([], executed)
 
-    def execute_then_stop(action_id: int, magnitude: float) -> bool:
+    def execute_then_stop(action_id: int, magnitude: float, handle: Any = None) -> bool:
         executed.append((action_id, magnitude))
         if len(executed) >= 2:
-            skill._running.clear()  # urgent stop arrives mid-batch
+            # urgent stop arrives mid-batch: the stop skill's own signal
+            skill._runtime.request_cancel()
         return True
 
     skill._execute = execute_then_stop  # type: ignore[method-assign]
-    result = StreamVlnSkill._run(skill, "walk to the sofa")
+    result = StreamVlnSkill.stream_vln(skill, "walk to the sofa")
 
     # The batch finished (both goals executed); the stop surfaced at the
     # next turn's running-check.
-    assert result == "Stopped by stop_navigation or stop_movement."
+    assert result == "Stopped by stop_stream_vln, stop_navigation or stop_movement."
     assert executed == [(_FORWARD, 75.0), (_FORWARD, 25.0)]
     assert skill.tele_cmd_vel.twists[-1] == Twist.zero()
     assert skill._navigation.cancelled == 1
