@@ -68,6 +68,10 @@ _RESPONSES_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 # How much of a failed turn's error message goes into the agent's history.
 _FAILED_TURN_ERROR_CHARS = 300
 
+# Tolerance absorbing within-turn clock jitter between an invocation stamp and
+# a turn-open stamp (same thread, microseconds apart in practice).
+_INVOCATION_TOLERANCE_S = 0.05
+
 
 def _preload_agent_deps() -> None:
     import langchain.agents
@@ -145,6 +149,11 @@ class Agent(BaseAgent):
     # whose call's turn closed is a leftover, age notwithstanding.
     _tool_invocations: dict[str, float]
     _turn_tool_calls: set[str] | None
+    # Turn-open timestamps (OBSERVE fix): an artefact whose call started
+    # within the PREVIOUS turn's window is that turn's continuation (valid);
+    # older stamps are cross-turn leftovers (the duplicate-run root cause).
+    _turn_opened_at: float | None
+    _prev_turn_opened_at: float | None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -165,6 +174,8 @@ class Agent(BaseAgent):
         self._tool_stream_cleanup = None
         self._tool_invocations = {}
         self._turn_tool_calls = None
+        self._turn_opened_at = None
+        self._prev_turn_opened_at = None
         # Tools may execute on executor threads while the loop thread holds
         # self._lock inside _process_message — the invocation ledger must
         # never contend with it (a pre-GATE deadlock; call_tool used to
@@ -533,38 +544,68 @@ class Agent(BaseAgent):
             return now
 
     def _tool_invocation_is_live(self, name: str, recorded_at: float) -> bool:
-        """Whether an artefact's originating call belongs to an open turn.
+        """Whether an artefact's originating call is a valid continuation.
 
-        The call key is the tool NAME (the artefact's UUID is minted after
-        the call returns, so per-UUID tracking would need McpServer-side
-        plumbing; a same-name re-open is exactly the takeover case the
-        capability registry already token-scopes). Not live when the record
-        is gone (its turn closed — a leftover of a finished task) or when a
-        newer invocation of the same tool superseded this artefact's call.
+        The semantics (OBSERVE fix; see root_cause in the artefacts):
+
+        VALID — the call started within the LAST OPENED turn's window: a
+        tool image queued by that turn is its legitimate continuation into
+        the consuming turn (the LangGraph convention this agent has always
+        used: artefacts feed the next model call). This covers the exact
+        production sequence — call_tool runs inside the stream, queues the
+        image, the turn closes, and only then the loop consumes it — and
+        background tools whose images arrive later while no newer same-tool
+        call happened.
+
+        INVALID — the call's stamp predates the last opened turn's window
+        (a cross-turn leftover of an older task: the duplicate-run root
+        cause), OR a NEWER invocation of the same tool superseded this
+        artefact's call (consecutive same-tool calls must not cross-wire;
+        the invocation map's latest stamp wins).
+
+        Note the gate runs BEFORE the consuming turn's _open_agent_turn,
+        so `_turn_opened_at` is exactly the producing turn's open time.
+
+        The call key is the tool NAME (per-UUID tracking would need
+        McpServer-side plumbing; same-name takeover scoping already matches
+        the capability registry's token semantics).
         """
         with self._invocation_lock:
-            started = self._tool_invocations.get(name)
-            if started is None:
+            window_start = self._turn_opened_at
+            if window_start is None:
+                # No turn has opened yet: nothing valid can predate it.
                 return False
-            return recorded_at >= started - 0.5
+            if recorded_at + _INVOCATION_TOLERANCE_S < window_start:
+                return False  # older than the producing turn: cross-turn leftover
+            started = self._tool_invocations.get(name)
+            if started is not None and recorded_at + _INVOCATION_TOLERANCE_S < started:
+                return False  # superseded by a newer same-tool call
+            return True
 
     def _open_agent_turn(self) -> None:
-        """Open a fresh live-call set for the agent turn about to stream."""
-        with self._invocation_lock:
-            self._turn_tool_calls = set()
+        """Open a fresh live-call set for the agent turn about to stream.
 
-    def _close_agent_turn(self) -> None:
-        """Close the turn: every call it made is now answered-or-abandoned.
-
-        After this, an artefact still referencing one of the turn's calls is
-        a leftover of a closed turn — dropped by the liveness gate no matter
-        how young it is. (The call set, not a per-UUID ledger, is the scope:
-        the MCP side already scopes same-name takeovers by token.)
+        The opening time is kept: an artefact whose originating call started
+        within the PREVIOUS turn's open window is that turn's legitimate
+        continuation — the LangGraph convention this agent has always used
+        (a tool's image is fed to the NEXT model call as a user turn) — and
+        must survive the previous turn's close. Artefacts whose call stamp
+        predates the previous turn's window are cross-turn leftovers.
         """
         with self._invocation_lock:
-            calls = self._turn_tool_calls or set()
-            for name in calls:
-                self._tool_invocations.pop(name, None)
+            self._turn_tool_calls = set()
+            self._prev_turn_opened_at = self._turn_opened_at
+            self._turn_opened_at = time.time()
+
+    def _close_agent_turn(self) -> None:
+        """Close the turn's live-call set.
+
+        Same-name takeovers stay impossible (a newer call's stamp still
+        supersedes an older artefact via the invocation map), but the close
+        no longer invalidates the turn's OWN queued products: they are judged
+        against the previous-turn window (see _tool_invocation_is_live).
+        """
+        with self._invocation_lock:
             self._turn_tool_calls = None
 
     def _process_message(

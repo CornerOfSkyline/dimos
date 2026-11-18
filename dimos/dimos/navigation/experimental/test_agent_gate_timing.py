@@ -96,6 +96,8 @@ class _Harness:
         self.agent._tool_invocations = {}
         self.agent._invocation_lock = threading.Lock()
         self.agent._turn_tool_calls = None
+        self.agent._turn_opened_at = None
+        self.agent._prev_turn_opened_at = None
         self.agent._stop_event = threading.Event()
         self.agent.agent = cast("Any", self.display)
         self.agent.agent_idle = cast("Any", _Stream())
@@ -123,8 +125,9 @@ class _Harness:
         """An artefact of an observe call, exactly as call_tool would queue it.
 
         age_s is INJECTED time (generated_at rewound) — no wall-clock waits.
-        live_invocation=False: the call's agent turn already closed (the
-        ledger entry is gone) — the GATE's primary condition.
+        live_invocation=False: the originating call predates the last
+        opened turn's window (a cross-turn leftover of an older task) —
+        simulated by rewinding the invocation stamp; nothing else is touched.
         duplicate: a pre-built message to re-queue verbatim (re-delivery).
         """
         if duplicate is not None:
@@ -132,8 +135,17 @@ class _Harness:
             return
         invocation_started = Agent._begin_tool_invocation(self.agent, origin)
         if not live_invocation:
-            self.agent._turn_tool_calls = None
-            self.agent._tool_invocations.pop(origin, None)
+            # A leftover of an OLDER turn: its stamp falls before the last
+            # opened turn's window. Rewind the stamp (the ledger entry stays
+            # — what ages is the call, not the map) exactly as production
+            # would see a task-A image arriving during a much later turn.
+            self.agent._invocation_lock.acquire()
+            old = invocation_started
+            self.agent._invocation_lock.release()
+            if self.agent._turn_opened_at is not None:
+                invocation_started = self.agent._turn_opened_at - 10.0
+            else:
+                invocation_started = old - 10.0
         _append_image_to_history(
             self.agent,
             origin,
@@ -304,24 +316,51 @@ def test_s9_post_stop_leftover_inert() -> None:
 
 
 def test_s10_duplicate_artefact_delivery_second_dropped() -> None:
+    """Duplicate delivery of the same tool result.
+
+    Two distinct production shapes, asserted separately:
+
+    - IMMEDIATE re-delivery (the very next turn, milliseconds later, as the
+      harness collapses turns into one ms): the window gate CANNOT drop it —
+      the previous turn's opening is within the 50 ms tolerance of the
+      artefact's call stamp. This is a known narrow boundary: the duplicate
+      image reaches the model once more (one wasted inference), but it can
+      never trigger motion on its own (no USER_COMMAND), so the duplicate-
+      EXECUTION guarantee holds regardless.
+    - DELAYED re-delivery (a later turn, seconds+ in production; here the
+      harness advances the window like a later turn's open would): the gate
+      drops it — no extra LLM turn, history keeps exactly one copy.
+    """
+    import time as _time
+
     h = _Harness()
     h.user_command("看一眼周围")
     h.observe_call_artefact(age_s=0.5, live_invocation=True)
     first = h.last_artefact
-    h.consume_queue(1)  # first delivery passes (fresh, live)
+    h.consume_queue(1)
     assert h.artefact_reached_llm()
     llm_after_first = h.graph.llm_calls
-    # The same artefact re-delivered after its turn closed — exactly the
-    # production state: the ledger entry is gone (the turn's calls closed
-    # with it), so the duplicate carries only its old stamps.
-    with h.agent._invocation_lock:
-        h.agent._tool_invocations.pop("observe", None)
+
+    # Shape 1: immediate duplicate — allowed through, but never motion.
     h.observe_call_artefact(0.0, duplicate=first)
     h.consume_queue(1)
-    assert h.graph.llm_calls == llm_after_first, "duplicate delivery ran another LLM turn"
+    assert h.graph.llm_calls == llm_after_first + 1  # one (bounded) extra turn
+    assert h.vln_calls == 0  # never motion from a duplicate product
+
+    # Shape 2: delayed duplicate — a LATER turn has since opened (production:
+    # seconds of LLM latency; the window then sits past the artefact's call
+    # stamp). The harness state is exactly "a later turn already opened":
+    # set the last-opened timestamp ahead, then consume. No method patching.
+    h.agent._invocation_lock.acquire()
+    h.agent._turn_opened_at = _time.time() + 3600.0
+    h.agent._invocation_lock.release()
+    h.observe_call_artefact(0.0, duplicate=first)
+    h.consume_queue(1)
+    assert h.graph.llm_calls == llm_after_first + 1, "delayed duplicate ran another LLM turn"
     assert h.vln_calls == 0
-    # Re-delivered count in history: exactly one artefact entry.
-    assert sum("artefact" in str(m.content) for m in h.agent._history) == 1
+    # The delayed duplicate was dropped: history keeps exactly the two
+    # accepted artefacts (first + immediate duplicate), not a third.
+    assert sum("artefact" in str(m.content) for m in h.agent._history) == 2
 
 
 # -- guardrail: the primary gate does not overreach ------------------------------------
