@@ -72,6 +72,11 @@ _FAILED_TURN_ERROR_CHARS = 300
 # a turn-open stamp (same thread, microseconds apart in practice).
 _INVOCATION_TOLERANCE_S = 0.05
 
+# Background motion tools a TOOL_RESULT-driven turn must not START off the
+# artefact (the duplicate-run accident's shape). Extend as more appear; a
+# proper per-skill "motion" annotation could drive this from the registry.
+_PRODUCT_TURN_MOTION_TOOLS = ("active_vln", "stream_vln")
+
 
 def _preload_agent_deps() -> None:
     import langchain.agents
@@ -154,6 +159,9 @@ class Agent(BaseAgent):
     # older stamps are cross-turn leftovers (the duplicate-run root cause).
     _turn_opened_at: float | None
     _prev_turn_opened_at: float | None
+    # What kind of message drove the current turn ("user" | "tool_result").
+    # The product-turn motion guard reads it (see _mcp_tool_call).
+    _turn_origin: str | None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -176,6 +184,7 @@ class Agent(BaseAgent):
         self._turn_tool_calls = None
         self._turn_opened_at = None
         self._prev_turn_opened_at = None
+        self._turn_origin = None
         # Tools may execute on executor threads while the loop thread holds
         # self._lock inside _process_message — the invocation ledger must
         # never contend with it (a pre-GATE deadlock; call_tool used to
@@ -240,6 +249,35 @@ class Agent(BaseAgent):
                 logger.debug("Interrupt stop call failed", tool=stop_tool)
 
     def _mcp_tool_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        # Hard layer of the product-turn guard (OBSERVE-FOLLOWUP): a turn
+        # driven by a TOOL_RESULT (not a USER_COMMAND) may not START a
+        # background motion task off the artefact — the original duplicate-run
+        # accident's shape. The refusal is a normal tool result (the model
+        # can relay it); the motion never happens. User-driven turns and
+        # non-motion tools are unaffected; observe images stay visible.
+        if (
+            getattr(self, "_turn_origin", None) == "tool_result"
+            and name in _PRODUCT_TURN_MOTION_TOOLS
+        ):
+            logger.info(
+                "Refused product-driven motion tool call",
+                tool=name,
+                reason="the turn is driven by a tool result, not a user command",
+            )
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Refused: '{name}' was requested from a turn driven by "
+                            "a tool's own result, not by the user. Do not start or "
+                            "repeat motion tasks from tool results; wait for an "
+                            "explicit user request. If the task result looks "
+                            "wrong, describe what you see and let the user decide."
+                        ),
+                    }
+                ]
+            }
         progress_token = str(uuid.uuid4())
         return self._mcp_request(
             "tools/call",
@@ -672,6 +710,17 @@ class Agent(BaseAgent):
                     return
         self.agent_idle.publish(False)
         turn_start = len(self._history)
+        # What drove this turn: the guard's ground truth (USER_COMMAND turns
+        # may start anything; TOOL_RESULT turns may not start motion).
+        if isinstance(message, HumanMessage):
+            kw = message.additional_kwargs or {}
+            self._turn_origin = (
+                MESSAGE_KIND_USER_COMMAND
+                if kw.get(MESSAGE_KIND_KEY) == MESSAGE_KIND_USER_COMMAND
+                else "tool_result"
+            )
+        else:
+            self._turn_origin = None
         self._open_agent_turn()
         self._record(message)
 
@@ -709,6 +758,7 @@ class Agent(BaseAgent):
             # The turn is over (streamed out or failed): every tool call it
             # made is now closed, so any artefact still referencing one is a
             # leftover the liveness gate drops, age notwithstanding.
+            self._turn_origin = None
             self._close_agent_turn()
 
         if self._message_queue.empty():
