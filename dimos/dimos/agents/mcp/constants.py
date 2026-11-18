@@ -52,7 +52,13 @@ MESSAGE_KIND_TOOL_PROGRESS = "tool_progress"
 # A TOOL_RESULT older than this at consumption time is stale: the model must
 # not treat it as a fresh observation (a 13 s-old observe image, consumed
 # after a 117 s VLN run plus queued progress, triggered a duplicate task).
+# SECONDARY check only: the primary gate is call-liveness — an artefact of a
+# closed agent turn is a leftover regardless of age.
 TOOL_RESULT_STALE_AFTER_S = 15.0
+
+# `HumanMessage.additional_kwargs` key carrying the originating tool call's
+# invocation stamp (Agent._begin_tool_invocation); see Agent._process_message.
+INVOCATION_STARTED_KEY = "invocation_started"
 
 
 def mcp_url(host: str, port: int) -> str:

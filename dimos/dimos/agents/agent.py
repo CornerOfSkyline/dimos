@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import re
+import threading
 from threading import Event, RLock, Thread
 import time
 from typing import Any
@@ -42,6 +43,7 @@ from dimos.agents.llm_trace import tracing_http_client
 from dimos.agents.mcp import tool_stream
 from dimos.agents.mcp.constants import (
     GENERATED_AT_KEY,
+    INVOCATION_STARTED_KEY,
     MESSAGE_KIND_KEY,
     MESSAGE_KIND_TOOL_PROGRESS,
     MESSAGE_KIND_TOOL_RESULT,
@@ -133,13 +135,16 @@ class Agent(BaseAgent):
     _http_client: requests.Session
     _seq_ids: SequentialIds
     _tool_stream_cleanup: Callable[[], None] | None
-    # Monotonic map of in-flight tool invocations (call_id -> started_at),
+    # Monotonic map of in-flight tool invocations (tool_name -> started_at),
     # used to judge TOOL_RESULT freshness at consumption time (see
     # _process_message): an observe image that sat in the queue behind a
     # minutes-long VLN run must not present itself to the LLM as a fresh
     # observation (it caused a duplicate active_vln execution — see
-    # artifacts/vln_m1/m1_01b/root_cause.md).
+    # artifacts/vln_m1/m1_01b/root_cause.md). The live set is swapped per
+    # agent turn: a call belongs to the turn that made it, and an artefact
+    # whose call's turn closed is a leftover, age notwithstanding.
     _tool_invocations: dict[str, float]
+    _turn_tool_calls: set[str] | None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -159,6 +164,12 @@ class Agent(BaseAgent):
         self._seq_ids = SequentialIds()
         self._tool_stream_cleanup = None
         self._tool_invocations = {}
+        self._turn_tool_calls = None
+        # Tools may execute on executor threads while the loop thread holds
+        # self._lock inside _process_message — the invocation ledger must
+        # never contend with it (a pre-GATE deadlock; call_tool used to
+        # touch no shared state before the request).
+        self._invocation_lock = threading.Lock()
         self._mcp_url: str | None = None
         Thread(target=_preload_agent_deps, name="Agent-preload", daemon=True).start()
 
@@ -302,6 +313,10 @@ class Agent(BaseAgent):
         input_schema = mcp_tool.get("inputSchema", {"type": "object", "properties": {}})
 
         def call_tool(**kwargs: Any) -> str:
+            # The invocation stamp rides on every artefact this call queues
+            # (see _begin_tool_invocation): the freshness gate can then tell
+            # "belongs to an open agent turn" from "leftover of a closed one".
+            invocation_started = self._begin_tool_invocation(name)
             result = self._mcp_tool_call(name, kwargs)
             content = result.get("content", [])
             parts = [c.get("text", "") for c in content if c.get("type") == "text"]
@@ -314,7 +329,7 @@ class Agent(BaseAgent):
                 if item.get("type") != "text":
                     uuid_ = str(uuid.uuid4())
                     text += f"Tool call started with UUID: {uuid_}. You will be updated with the result soon."
-                    _append_image_to_history(self, name, uuid_, item)
+                    _append_image_to_history(self, name, uuid_, item, invocation_started)
 
             return text
 
@@ -502,47 +517,121 @@ class Agent(BaseAgent):
                     raise ValueError("No state graph initialized")
                 self._process_message(self._state_graph, message)
 
+    def _begin_tool_invocation(self, name: str) -> float:
+        """Mark a live tool invocation by this agent turn (returns its clock).
+
+        The invocation-stamp rides on every artefact the call later queues
+        (see _append_image_to_history), so _process_message can tell "the
+        artefact belongs to a call whose agent turn is still open" (the
+        valid case) from one that outlived its turn.
+        """
+        with self._invocation_lock:
+            now = time.time()
+            self._tool_invocations[name] = now
+            if self._turn_tool_calls is not None:
+                self._turn_tool_calls.add(name)
+            return now
+
+    def _tool_invocation_is_live(self, name: str, recorded_at: float) -> bool:
+        """Whether an artefact's originating call belongs to an open turn.
+
+        The call key is the tool NAME (the artefact's UUID is minted after
+        the call returns, so per-UUID tracking would need McpServer-side
+        plumbing; a same-name re-open is exactly the takeover case the
+        capability registry already token-scopes). Not live when the record
+        is gone (its turn closed — a leftover of a finished task) or when a
+        newer invocation of the same tool superseded this artefact's call.
+        """
+        with self._invocation_lock:
+            started = self._tool_invocations.get(name)
+            if started is None:
+                return False
+            return recorded_at >= started - 0.5
+
+    def _open_agent_turn(self) -> None:
+        """Open a fresh live-call set for the agent turn about to stream."""
+        with self._invocation_lock:
+            self._turn_tool_calls = set()
+
+    def _close_agent_turn(self) -> None:
+        """Close the turn: every call it made is now answered-or-abandoned.
+
+        After this, an artefact still referencing one of the turn's calls is
+        a leftover of a closed turn — dropped by the liveness gate no matter
+        how young it is. (The call set, not a per-UUID ledger, is the scope:
+        the MCP side already scopes same-name takeovers by token.)
+        """
+        with self._invocation_lock:
+            calls = self._turn_tool_calls or set()
+            for name in calls:
+                self._tool_invocations.pop(name, None)
+            self._turn_tool_calls = None
+
     def _process_message(
         self, state_graph: CompiledStateGraph[Any, Any, Any, Any], message: BaseMessage
     ) -> None:
-        # TOOL_RESULT freshness gate (P0): a tool product that sat in the
-        # queue behind a long-running tool (a VLN episode) is stale by the
-        # time the loop can consume it. Feeding it to the LLM as the only
-        # new input after a completed task made the model re-issue the same
-        # VLN instruction (root_cause.md). Stale results are dropped for the
-        # LLM (reason logged; the cockpit already saw the image when the
-        # tool ran) — they never start new reasoning turns. USER_COMMAND
+        # TOOL_RESULT gate (P0 + GATE hardening), primary-then-secondary:
+        #
+        # 1. CALL LIVENESS (primary): the artefact's originating tool call
+        #    must belong to a still-open agent turn. A closed or superseded
+        #    invocation's product is a leftover — dropped regardless of age,
+        #    so a 1 s-old image of a finished task can never pose as fresh
+        #    input (the 15 s threshold alone could not guarantee that).
+        # 2. AGE (secondary): a live call's artefact that queued behind a
+        #    long-running sibling tool (a VLN episode) is stale at
+        #    consumption time — dropped for the LLM (reason logged; the
+        #    cockpit already saw the image when the tool ran).
+        #
+        # Dropped products never start reasoning turns, so no re-execution of
+        # finished VLN tasks is reachable from a tool result. USER_COMMAND
         # messages are never gated: an explicit user request is always
         # honored, including repeating a finished task.
         if isinstance(message, HumanMessage):
             kwargs = message.additional_kwargs or {}
             if kwargs.get(MESSAGE_KIND_KEY) == MESSAGE_KIND_TOOL_RESULT:
+                origin = kwargs.get(TOOL_ORIGIN_KEY, "?")
                 generated_at = kwargs.get(GENERATED_AT_KEY)
-                if isinstance(generated_at, (int, float)):
-                    age = time.time() - generated_at
+                invocation_started = kwargs.get(INVOCATION_STARTED_KEY)
+                drop_reason: str | None = None
+                if not isinstance(invocation_started, (int, float)):
+                    # Pre-lifecycle artefact (older M1-01B form): fall back to
+                    # the age-only check below.
+                    invocation_started = None
+                if invocation_started is not None and not self._tool_invocation_is_live(
+                    origin, float(invocation_started)
+                ):
+                    drop_reason = "its originating tool call's agent turn already closed"
+                elif isinstance(generated_at, (int, float)):
+                    age = time.time() - float(generated_at)
                     if age > TOOL_RESULT_STALE_AFTER_S:
-                        origin = kwargs.get(TOOL_ORIGIN_KEY, "?")
-                        logger.info(
-                            "Dropped stale tool result (never reached the LLM)",
-                            tool=origin,
-                            age_s=round(age, 1),
-                            reason="consumed after a long-running turn; feeding it "
-                            "back re-triggered a completed VLN task once",
+                        drop_reason = (
+                            f"it arrived {age:.0f} s late (queued behind a long task turn)"
                         )
-                        self.agent.publish(
-                            AIMessage(
-                                content=(
-                                    f"[tool:{origin}] An image result arrived "
-                                    f"{age:.0f} s late (it queued behind a long task "
-                                    "turn); it was not shown to the model to avoid "
-                                    "acting on an outdated view."
-                                ),
-                                additional_kwargs={MESSAGE_KIND_KEY: MESSAGE_KIND_TOOL_PROGRESS},
-                            )
+                if drop_reason is not None:
+                    age_s = (
+                        round(time.time() - float(generated_at), 1)
+                        if isinstance(generated_at, (int, float))
+                        else None
+                    )
+                    logger.info(
+                        "Dropped leftover tool result (never reached the LLM)",
+                        tool=origin,
+                        age_s=age_s,
+                        reason=drop_reason,
+                    )
+                    self.agent.publish(
+                        AIMessage(
+                            content=(
+                                f"[tool:{origin}] An image result was not shown to "
+                                f"the model: {drop_reason}."
+                            ),
+                            additional_kwargs={MESSAGE_KIND_KEY: MESSAGE_KIND_TOOL_PROGRESS},
                         )
-                        return
+                    )
+                    return
         self.agent_idle.publish(False)
         turn_start = len(self._history)
+        self._open_agent_turn()
         self._record(message)
 
         try:
@@ -575,6 +664,11 @@ class Agent(BaseAgent):
                     additional_kwargs={TURN_FAILED_KEY: True},
                 )
             )
+        finally:
+            # The turn is over (streamed out or failed): every tool call it
+            # made is now closed, so any artefact still referencing one is a
+            # leftover the liveness gate drops, age notwithstanding.
+            self._close_agent_turn()
 
         if self._message_queue.empty():
             self.agent_idle.publish(True)
@@ -652,36 +746,20 @@ def _vln_progress_telemetry(tool_name: str, text: str) -> dict[str, Any] | None:
     }
 
 
-_VLN_PROGRESS_RE = re.compile(r"^turn (?P<turn>\d+)/(?P<max>\d+): (?P<actions>\d+) actions$")
-
-
-def _vln_progress_telemetry(tool_name: str, text: str) -> dict[str, Any] | None:
-    """Structured VLN task telemetry off a tool-update message.
-
-    The VLN skills' tool_update text is "turn 3/50: 4 actions"; the parsed
-    fields ride the cockpit progress frame so the UI can show
-    policy/turn/stage without any LLM round trip. The two policy skills'
-    tool names map to the policy name.
-    """
-    match = _VLN_PROGRESS_RE.match(text.strip())
-    if match is None:
-        return None
-    return {
-        "tool": tool_name,
-        "policy": {"active_vln": "activevln", "stream_vln": "streamvln"}.get(tool_name, tool_name),
-        "current_turn": int(match["turn"]),
-        "max_turns": int(match["max"]),
-        "actions": int(match["actions"]),
-        "stage": "ACTION_EXECUTION",
-    }
-
-
-def _append_image_to_history(agent: Agent, func_name: str, uuid_: str, result: Any) -> None:
+def _append_image_to_history(
+    agent: Agent,
+    func_name: str,
+    uuid_: str,
+    result: Any,
+    invocation_started: float | None = None,
+) -> None:
     # Tagged with its tool, or chat UIs would show this user turn as typed input.
-    # Generated-at rides along (TOOL_RESULT class, message_kind=tool_result):
-    # _process_message checks the age at consumption time — an image queued
-    # behind a minutes-long VLN run must not reach the LLM as if fresh (it
-    # caused a duplicate active_vln execution; root_cause.md).
+    # Generated-at rides along (TOOL_RESULT class, message_kind=tool_result)
+    # AND the originating call's invocation stamp: _process_message gates on
+    # call liveness first (a closed turn's artefact is a leftover no matter
+    # how young) and age second — an image queued behind a minutes-long VLN
+    # run must not reach the LLM as if fresh (it caused a duplicate
+    # active_vln execution; root_cause.md).
     agent.add_message(
         HumanMessage(
             content=[
@@ -695,6 +773,7 @@ def _append_image_to_history(agent: Agent, func_name: str, uuid_: str, result: A
                 TOOL_ORIGIN_KEY: func_name,
                 MESSAGE_KIND_KEY: "tool_result",
                 GENERATED_AT_KEY: time.time(),
+                INVOCATION_STARTED_KEY: invocation_started,
             },
         )
     )

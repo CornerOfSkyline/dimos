@@ -106,6 +106,8 @@ class AgentStub:
         self.agent._history = []
         self.agent._tool_stream_cleanup = None
         self.agent._tool_invocations = {}
+        self.agent._invocation_lock = threading.Lock()
+        self.agent._turn_tool_calls = None
         self.agent._stop_event = threading.Event()
         self.agent.agent = self.agent_stream
         self.agent.agent_idle = self.agent_idle_stream
