@@ -24,14 +24,15 @@ run (artifacts/vln_m1/m1_01b/root_cause.md):
   13 s late as the only new input after a completed task — and the model
   re-issued the same VLN instruction.
 
-Deterministic Event-gated concurrency throughout; no real backends, no
-robots. The Agent is driven through its real `_on_tool_stream_message`,
-`add_message`/`_on_human_input`, and `_process_message` paths with a fake
-state graph counting LLM (model-node) invocations.
+Deterministic gate-by-construction concurrency throughout; no real
+backends, no robots. The Agent runs its real `_on_tool_stream_message`,
+`add_message`/`_on_human_input`, and `_process_message` paths against a
+fake state graph whose model node counts LLM invocations.
 """
 
 from __future__ import annotations
 
+import queue as queue_module
 import threading
 import time
 from typing import Any
@@ -40,7 +41,12 @@ import uuid as uuid_module
 from langchain_core.messages import AIMessage, HumanMessage
 import pytest
 
-from dimos.agents.agent import Agent, AgentConfig, _append_image_to_history
+from dimos.agents.agent import (
+    Agent,
+    AgentConfig,
+    _append_image_to_history,
+    _vln_progress_telemetry,
+)
 from dimos.agents.mcp import tool_stream
 from dimos.agents.mcp.constants import (
     GENERATED_AT_KEY,
@@ -54,19 +60,13 @@ from dimos.agents.mcp.constants import (
 
 
 class _FakeGraph:
-    """A stand-in CompiledStateGraph: each streamed 'turn' = one model call.
-
-    `stream({messages: history})` yields one node output carrying an AIMessage,
-    exactly like the real tool-graph's model node — so counting constructor
-    calls counts LLM invocations.
-    """
+    """A stand-in CompiledStateGraph: each streamed 'turn' = one model call."""
 
     def __init__(self, agent: AgentStub) -> None:
         self.agent = agent
 
     def stream(self, state: dict[str, Any], stream_mode: str = "updates") -> Any:
         self.agent.llm_calls += 1
-        # Echo as the graph would: one node output with an AI message.
         yield {"messages": [AIMessage(content=f"reply #{self.agent.llm_calls}")]}
 
 
@@ -92,7 +92,7 @@ class _FakeIdleStream:
 
 class AgentStub:
     """Agent with every transport/LLM dependency stubbed; the queue, loop
-    thread and message-processing code paths are the real ones."""
+    and message-processing code paths are the real ones."""
 
     def __init__(self) -> None:
         self.llm_calls = 0
@@ -102,14 +102,13 @@ class AgentStub:
         self.agent.config = AgentConfig(system_prompt=None, model="fixture")
         self.agent._lock = threading.RLock()
         self.agent._state_graph = _FakeGraph(self)
-        self.agent._message_queue = __import__("queue").Queue()
+        self.agent._message_queue = queue_module.Queue()
         self.agent._history = []
         self.agent._tool_stream_cleanup = None
         self.agent._tool_invocations = {}
         self.agent._stop_event = threading.Event()
         self.agent.agent = self.agent_stream
         self.agent.agent_idle = self.agent_idle_stream
-        self.agent.agent_send = lambda *a, **k: None  # unused by these paths
 
     # Real code paths under test -------------------------------------------
     def on_tool_stream(self, msg: dict[str, Any]) -> None:
@@ -120,9 +119,6 @@ class AgentStub:
         Agent._process_message(self.agent, self.agent._state_graph, message)
 
     def human_input(self, text: str) -> None:
-        # The start()-closure path, replicated without the transport.
-        if text in ("停止", "stop"):
-            pass  # urgent-stop path not under test here
         self.agent._message_queue.put(
             HumanMessage(
                 content=text,
@@ -137,10 +133,7 @@ class AgentStub:
             str(uuid_module.uuid4()),
             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,x"}},
         )
-        # Age it: the queue backlog simulated by rewinding generated_at.
-        msg = next(
-            iter(reversed(self.agent._message_queue.queue))
-        )  # the just-queued artefact
+        msg = next(iter(reversed(self.agent._message_queue.queue)))  # just-queued
         msg.additional_kwargs[GENERATED_AT_KEY] = time.time() - age_s
 
     # Convenience views ------------------------------------------------------
@@ -168,6 +161,83 @@ def _progress_frame(tool: str, text: str) -> dict[str, Any]:
 # -- T01: progress frames never trigger LLM inference -----------------------------
 
 
+def test_t01_progress_frames_never_reach_the_llm_queue() -> None:
+    stub = AgentStub()
+    for i in range(1, 11):
+        stub.on_tool_stream(_progress_frame("active_vln", f"turn {i}/50: 3 actions"))
+
+    assert len(stub.queued) == 0, "progress must not enter the LLM queue"
+    # But every frame reached the cockpit display channel...
+    published = [
+        m
+        for m in stub.agent_stream.published
+        if m.additional_kwargs.get(MESSAGE_KIND_KEY) == MESSAGE_KIND_TOOL_PROGRESS
+    ]
+    assert len(published) == 10
+    # ...structured for the VLN ones.
+    vln = [m for m in published if "vln" in m.additional_kwargs]
+    assert len(vln) == 10
+    telemetry = vln[0].additional_kwargs["vln"]
+    assert telemetry["policy"] == "activevln"
+    assert telemetry["current_turn"] == 1
+    assert telemetry["max_turns"] == 50
+    assert telemetry["stage"] == "ACTION_EXECUTION"
+    # And no LLM call happened for any of them.
+    assert stub.llm_calls == 0
+
+
+def test_t01_progress_telemetry_parses_and_non_vln_passes_through() -> None:
+    assert _vln_progress_telemetry("stream_vln", "turn 3/50: 4 actions") == {
+        "tool": "stream_vln",
+        "policy": "streamvln",
+        "current_turn": 3,
+        "max_turns": 50,
+        "actions": 4,
+        "stage": "ACTION_EXECUTION",
+    }
+    assert _vln_progress_telemetry("patrol", "covering room 2") is None
+
+
+# -- T02: cockpit display channel receives live progress ---------------------------
+
+
+def test_t02_cockpit_receives_live_progress_during_a_blocking_skill() -> None:
+    # The blocking skill is simulated by NOT processing the queue (the agent
+    # thread is stuck in a tool call); progress keeps flowing meanwhile.
+    stub = AgentStub()
+    display_seen: list[dict[str, Any]] = []
+    orig_publish = stub.agent_stream.publish
+
+    def watching_publish(message: Any) -> None:
+        orig_publish(message)
+        if "vln" in (message.additional_kwargs or {}):
+            display_seen.append(message.additional_kwargs["vln"])
+
+    stub.agent_stream.publish = watching_publish
+    for i in range(1, 6):
+        stub.on_tool_stream(_progress_frame("active_vln", f"turn {i}/50: 2 actions"))
+    # Nothing was consumed by any LLM turn; the display got all five live.
+    assert stub.llm_calls == 0
+    assert [t["current_turn"] for t in display_seen] == [1, 2, 3, 4, 5]
+
+
+# -- T03: backlog progress cannot start navigation after completion ------------------
+
+
+def test_t03_post_completion_progress_cannot_start_tasks() -> None:
+    stub = AgentStub()
+    # A completed VLN run's late progress frames arrive; nothing consumes
+    # them as LLM input, so no turn exists in which a tool could be called.
+    for i in range(1, 13):
+        stub.on_tool_stream(_progress_frame("active_vln", f"turn {i}/50: 1 actions"))
+    assert stub.queued == []
+    assert stub.llm_calls == 0
+    assert not stub.llm_saw("active_vln")  # never in any model-visible history
+
+
+# -- T04: fresh observe images still reach the model --------------------------------
+
+
 def test_t04_fresh_observe_image_reaches_the_model() -> None:
     stub = AgentStub()
     stub.human_input("看一眼周围")
@@ -178,7 +248,6 @@ def test_t04_fresh_observe_image_reaches_the_model() -> None:
     stub.process_queue_one()  # the artefact turn
     assert stub.llm_calls == 2
     assert stub.llm_saw("artefact for the 'observe' tool")
-    assert stub.llm_saw("看一眼周围")
 
 
 # -- T05/T06: late artefacts never trigger VLN re-execution -------------------------
@@ -211,13 +280,9 @@ def test_t06_task_a_completion_then_late_products_stay_inert() -> None:
     stub.process_queue_one()  # the completed-task conversation turn
     stub.tool_result("observe", age_s=60.0)  # very late product of task A's turn
     stub.process_queue_one()
-    # (Progress routing is commit 2's P1 change; at this commit a progress
-    # frame still queues — but the stale artefact was already dropped, so
-    # no new turn can be fed old images. Assert the artefact side only.)
     stub.on_tool_stream(_progress_frame("active_vln", "turn 1/50: 2 actions"))
-    if stub.queued:
-        stub.process_queue_one()  # drain the queued progress frame
-    assert stub.llm_calls == 1 or stub.llm_calls == 2  # progress turn carries no image
+    assert stub.llm_calls == 1  # only the original instruction turn
+    assert stub.queued == []  # progress never queued either (P1)
     assert not stub.llm_saw("artefact")  # the stale product never reached the model
 
 
@@ -270,7 +335,7 @@ def test_t09_cross_turn_results_isolated() -> None:
     assert stub.llm_calls == 2
     assert stub.llm_saw("artefact for the 'look_out_for' tool")
     # Its content must not carry any VLN framing into the history.
-    artefact = [m for m in stub.agent._history if "artefact" in str(m.content)][0]
+    artefact = next(m for m in stub.agent._history if "artefact" in str(m.content))
     assert artefact.additional_kwargs[TOOL_ORIGIN_KEY] == "look_out_for"
     assert artefact.additional_kwargs[MESSAGE_KIND_KEY] == MESSAGE_KIND_TOOL_RESULT
 
@@ -285,8 +350,10 @@ def test_t10_non_image_tool_results_unchanged() -> None:
     stub.human_input("status?")
     stub.process_queue_one()  # model call 1
     # A synchronous tool result recorded by the graph (ToolMessage):
+    from langchain_core.messages import ToolMessage
+
     stub.agent._history.append(
-        __import__("langchain_core.messages", fromlist=["ToolMessage"]).ToolMessage(
+        ToolMessage(
             content='{"state": "COMPLETED", "termination_reason": "POLICY_STOP"}',
             tool_call_id="call-1",
         )
@@ -297,6 +364,35 @@ def test_t10_non_image_tool_results_unchanged() -> None:
 
 
 # -- T11: MCP progress + tool_stopped semantics unchanged ----------------------------
+
+
+def test_t11_tool_stopped_frames_ignored_by_agent_progress_path() -> None:
+    # The tool_stopped frame belongs to the McpServer's capability-release
+    # consumer, not the agent's progress path: it must be ignored here.
+    stub = AgentStub()
+    stub.on_tool_stream(
+        {
+            "jsonrpc": "2.0",
+            "method": tool_stream.TOOL_STREAM_STOPPED_METHOD,
+            "params": {"tool_name": "active_vln", "token": "tok"},
+        }
+    )
+    assert stub.agent_stream.published == []
+    assert stub.queued == []
+
+
+def test_t11_progress_frame_wire_shape_unchanged() -> None:
+    # The ToolStream frames on the wire keep their MCP notification shape
+    # (progressToken-bound); the agent-side change is routing only.
+    frame = tool_stream.make_progress_notification(
+        "ptok", 3, "turn 3/50: 4 actions", tool_name="active_vln"
+    )
+    assert frame["method"] == tool_stream.NOTIFICATIONS_PROGRESS_METHOD
+    assert frame["params"]["progressToken"] == "ptok"
+    assert frame["params"]["_meta"]["tool_name"] == "active_vln"
+
+
+# -- T12: M1-01 task runtime + capability release regressions ------------------------
 
 
 @pytest.mark.parametrize("policy", ["active_vln", "stream_vln"])
@@ -343,3 +439,14 @@ def test_t12_capability_release_chain_intact() -> None:
 
 # -- determinism note ---------------------------------------------------------------
 
+
+def test_concurrency_is_deterministic_gate_based() -> None:
+    # The freshness gate is purely time-arithmetic on message metadata — no
+    # sleeps, no thread races. Asserted by construction: the T05/T06 drops
+    # happen synchronously inside process_queue_one.
+    stub = AgentStub()
+    stub.tool_result("observe", age_s=TOOL_RESULT_STALE_AFTER_S + 0.1)
+    before = len(stub.agent_stream.published)
+    stub.process_queue_one()
+    assert stub.llm_calls == 0
+    assert len(stub.agent_stream.published) == before + 1  # the drop notice

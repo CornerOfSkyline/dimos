@@ -229,6 +229,19 @@ class Agent(BaseAgent):
         )
 
     def _on_tool_stream_message(self, msg: dict[str, Any]) -> None:
+        """Route tool-stream frames.
+
+        Progress/telemetry frames (TOOL_PROGRESS) are cockpit display
+        traffic, NOT LLM input: each VLN turn used to cost one queued
+        HumanMessage and, once the blocking tool returned, one LLM call per
+        frame (12 calls for one 11-turn run) - and the queue backlog
+        delayed every artefact behind them. They are published on the
+        `agent` stream (the cockpit's chat channel) as structured telemetry
+        instead, VLN progress carrying run/policy/turn/stage parsed out
+        of the message text. Terminal `dimos/tool_stopped` frames are NOT
+        handled here (the McpServer subscribes to them for the capability
+        release; the Agent never sees them as input).
+        """
         method = msg.get("method")
         params = msg.get("params") or {}
         if method == tool_stream.NOTIFICATIONS_PROGRESS_METHOD:
@@ -241,8 +254,16 @@ class Agent(BaseAgent):
             return
         if not text:
             return
-        self._message_queue.put(HumanMessage(content=f"[tool:{tool_name}] {text}"))
-
+        telemetry = _vln_progress_telemetry(tool_name, text)
+        self.agent.publish(
+            AIMessage(
+                content=f"[tool:{tool_name}] {text}",
+                additional_kwargs={
+                    MESSAGE_KIND_KEY: MESSAGE_KIND_TOOL_PROGRESS,
+                    **({"vln": telemetry} if telemetry else {}),
+                },
+            )
+        )
 
     def _fetch_tools(self, timeout: float = 60.0, interval: float = 1.0) -> list[StructuredTool]:
         result = self._try_fetch_tools(timeout=timeout, interval=interval)
@@ -605,6 +626,30 @@ def _unanswered_tool_calls(messages: list[BaseMessage]) -> Iterator[str]:
             call_id = call["id"]
             if call_id is not None and call_id not in answered:
                 yield call_id
+
+
+_VLN_PROGRESS_RE = re.compile(r"^turn (?P<turn>\d+)/(?P<max>\d+): (?P<actions>\d+) actions$")
+
+
+def _vln_progress_telemetry(tool_name: str, text: str) -> dict[str, Any] | None:
+    """Structured VLN task telemetry off a tool-update message.
+
+    The VLN skills' tool_update text is "turn 3/50: 4 actions"; the parsed
+    fields ride the cockpit progress frame so the UI can show
+    policy/turn/stage without any LLM round trip. The two policy skills'
+    tool names map to the policy name.
+    """
+    match = _VLN_PROGRESS_RE.match(text.strip())
+    if match is None:
+        return None
+    return {
+        "tool": tool_name,
+        "policy": {"active_vln": "activevln", "stream_vln": "streamvln"}.get(tool_name, tool_name),
+        "current_turn": int(match["turn"]),
+        "max_turns": int(match["max"]),
+        "actions": int(match["actions"]),
+        "stage": "ACTION_EXECUTION",
+    }
 
 
 _VLN_PROGRESS_RE = re.compile(r"^turn (?P<turn>\d+)/(?P<max>\d+): (?P<actions>\d+) actions$")

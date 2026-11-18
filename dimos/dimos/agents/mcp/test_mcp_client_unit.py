@@ -28,7 +28,12 @@ import pytest
 import requests
 
 from dimos.agents.agent import Agent
-from dimos.agents.mcp.constants import TOOL_ORIGIN_KEY, TURN_FAILED_KEY
+from dimos.agents.mcp.constants import (
+    MESSAGE_KIND_KEY,
+    MESSAGE_KIND_TOOL_PROGRESS,
+    TOOL_ORIGIN_KEY,
+    TURN_FAILED_KEY,
+)
 from dimos.agents.testing.mock_model import MockModel
 from dimos.utils.testing.waiting import wait_until
 
@@ -210,7 +215,13 @@ def test_mcp_request_error_propagation(mcp_client: Agent) -> None:
 
 
 def test_tool_stream_notification_becomes_human_message(mcp_client: Agent) -> None:
-    """A `notifications/message` delivered over LCM becomes a HumanMessage."""
+    """A `notifications/message` becomes cockpit telemetry, not LLM input.
+
+    Since M1-01B, progress/telemetry frames are published on the `agent`
+    display stream (kind TOOL_PROGRESS) instead of entering the LLM message
+    queue - each queued frame cost a model call after a long blocking tool
+    drained its backlog (root cause of the duplicate-run bug family).
+    """
     notification = {
         "jsonrpc": "2.0",
         "method": "notifications/message",
@@ -220,12 +231,18 @@ def test_tool_stream_notification_becomes_human_message(mcp_client: Agent) -> No
             "data": "Person follow stopped: lost track.",
         },
     }
-    mcp_client._on_tool_stream_message(notification)
-
-    msg: BaseMessage = mcp_client._message_queue.get_nowait()
-    assert isinstance(msg, HumanMessage)
+    published: list[BaseMessage] = []
+    with patch.object(mcp_client, "agent") as agent_stream:
+        agent_stream.publish.side_effect = published.append
+        mcp_client._on_tool_stream_message(notification)
+    with pytest.raises(Empty):
+        mcp_client._message_queue.get_nowait()  # never enters the LLM queue
+    assert len(published) == 1
+    msg = published[0]
+    assert isinstance(msg, AIMessage)
     assert "[tool:follow_person]" in str(msg.content)
     assert "Person follow stopped: lost track." in str(msg.content)
+    assert msg.additional_kwargs[MESSAGE_KIND_KEY] == MESSAGE_KIND_TOOL_PROGRESS
 
 
 def test_tool_stream_ignores_unrelated_frames(mcp_client: Agent) -> None:
@@ -244,7 +261,7 @@ def test_tool_stream_ignores_unrelated_frames(mcp_client: Agent) -> None:
 
 
 def test_tool_stream_progress_frame_becomes_human_message(mcp_client: Agent) -> None:
-    """A `notifications/progress` frame is routed as a HumanMessage."""
+    """A `notifications/progress` frame is routed to the display stream."""
 
     progress_frame = {
         "jsonrpc": "2.0",
@@ -256,11 +273,14 @@ def test_tool_stream_progress_frame_becomes_human_message(mcp_client: Agent) -> 
             "_meta": {"tool_name": "follow_person"},
         },
     }
-    mcp_client._on_tool_stream_message(progress_frame)
-
-    msg: BaseMessage = mcp_client._message_queue.get_nowait()
-    assert isinstance(msg, HumanMessage)
-    assert str(msg.content) == "[tool:follow_person] Found a person"
+    published: list[BaseMessage] = []
+    with patch.object(mcp_client, "agent") as agent_stream:
+        agent_stream.publish.side_effect = published.append
+        mcp_client._on_tool_stream_message(progress_frame)
+    with pytest.raises(Empty):
+        mcp_client._message_queue.get_nowait()
+    assert len(published) == 1
+    assert str(published[0].content) == "[tool:follow_person] Found a person"
 
 
 def test_mcp_tool_call_sends_progress_token(mcp_client: Agent) -> None:
