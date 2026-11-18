@@ -13,10 +13,11 @@
 # limitations under the License.
 
 from collections.abc import Callable, Iterator
+import os
 from pathlib import Path
 from queue import Empty, Queue
+import re
 from threading import Event, RLock, Thread
-import os
 import time
 from typing import Any
 import uuid
@@ -39,7 +40,16 @@ import requests
 from dimos.agents.base_agent import BaseAgent
 from dimos.agents.llm_trace import tracing_http_client
 from dimos.agents.mcp import tool_stream
-from dimos.agents.mcp.constants import TOOL_ORIGIN_KEY, TURN_FAILED_KEY
+from dimos.agents.mcp.constants import (
+    GENERATED_AT_KEY,
+    MESSAGE_KIND_KEY,
+    MESSAGE_KIND_TOOL_PROGRESS,
+    MESSAGE_KIND_TOOL_RESULT,
+    MESSAGE_KIND_USER_COMMAND,
+    TOOL_ORIGIN_KEY,
+    TOOL_RESULT_STALE_AFTER_S,
+    TURN_FAILED_KEY,
+)
 from dimos.agents.mcp.spec import McpServerSpec
 from dimos.agents.system_prompt import SYSTEM_PROMPT
 from dimos.agents.utils import pretty_print_langchain_message
@@ -123,6 +133,13 @@ class Agent(BaseAgent):
     _http_client: requests.Session
     _seq_ids: SequentialIds
     _tool_stream_cleanup: Callable[[], None] | None
+    # Monotonic map of in-flight tool invocations (call_id -> started_at),
+    # used to judge TOOL_RESULT freshness at consumption time (see
+    # _process_message): an observe image that sat in the queue behind a
+    # minutes-long VLN run must not present itself to the LLM as a fresh
+    # observation (it caused a duplicate active_vln execution — see
+    # artifacts/vln_m1/m1_01b/root_cause.md).
+    _tool_invocations: dict[str, float]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -141,6 +158,7 @@ class Agent(BaseAgent):
         self._http_client = requests.Session()
         self._seq_ids = SequentialIds()
         self._tool_stream_cleanup = None
+        self._tool_invocations = {}
         self._mcp_url: str | None = None
         Thread(target=_preload_agent_deps, name="Agent-preload", daemon=True).start()
 
@@ -175,7 +193,6 @@ class Agent(BaseAgent):
         result: dict[str, Any] = data.get("result")
         return result
 
-
     def _interrupt_movement_skills(self) -> None:
         """Stop every movement-holding skill, from the human input thread.
 
@@ -186,9 +203,15 @@ class Agent(BaseAgent):
         better than none. The MCP server's capability layer preempts the
         holder when a stop tool conflicts with it (see mcp_server.py).
         """
-        for stop_tool in ("stop_stream_vln", "stop_active_vln", "stop_navigation",
-                          "stop_patrol", "stop_following", "stop_looking_out",
-                          "end_exploration"):
+        for stop_tool in (
+            "stop_stream_vln",
+            "stop_active_vln",
+            "stop_navigation",
+            "stop_patrol",
+            "stop_following",
+            "stop_looking_out",
+            "end_exploration",
+        ):
             try:
                 self._mcp_tool_call(stop_tool, {})
             except Exception:
@@ -219,6 +242,7 @@ class Agent(BaseAgent):
         if not text:
             return
         self._message_queue.put(HumanMessage(content=f"[tool:{tool_name}] {text}"))
+
 
     def _fetch_tools(self, timeout: float = 60.0, interval: float = 1.0) -> list[StructuredTool]:
         result = self._try_fetch_tools(timeout=timeout, interval=interval)
@@ -301,7 +325,14 @@ class Agent(BaseAgent):
                     )
                 )
                 return
-            self._message_queue.put(HumanMessage(content=string))
+            # USER_COMMAND: genuine human input — always reaches the LLM and
+            # may lawfully start (or repeat) any task, unlike TOOL_RESULT.
+            self._message_queue.put(
+                HumanMessage(
+                    content=string,
+                    additional_kwargs={MESSAGE_KIND_KEY: MESSAGE_KIND_USER_COMMAND},
+                )
+            )
 
         self.register_disposable(Disposable(self.human_input.subscribe(_on_human_input)))
 
@@ -453,6 +484,42 @@ class Agent(BaseAgent):
     def _process_message(
         self, state_graph: CompiledStateGraph[Any, Any, Any, Any], message: BaseMessage
     ) -> None:
+        # TOOL_RESULT freshness gate (P0): a tool product that sat in the
+        # queue behind a long-running tool (a VLN episode) is stale by the
+        # time the loop can consume it. Feeding it to the LLM as the only
+        # new input after a completed task made the model re-issue the same
+        # VLN instruction (root_cause.md). Stale results are dropped for the
+        # LLM (reason logged; the cockpit already saw the image when the
+        # tool ran) — they never start new reasoning turns. USER_COMMAND
+        # messages are never gated: an explicit user request is always
+        # honored, including repeating a finished task.
+        if isinstance(message, HumanMessage):
+            kwargs = message.additional_kwargs or {}
+            if kwargs.get(MESSAGE_KIND_KEY) == MESSAGE_KIND_TOOL_RESULT:
+                generated_at = kwargs.get(GENERATED_AT_KEY)
+                if isinstance(generated_at, (int, float)):
+                    age = time.time() - generated_at
+                    if age > TOOL_RESULT_STALE_AFTER_S:
+                        origin = kwargs.get(TOOL_ORIGIN_KEY, "?")
+                        logger.info(
+                            "Dropped stale tool result (never reached the LLM)",
+                            tool=origin,
+                            age_s=round(age, 1),
+                            reason="consumed after a long-running turn; feeding it "
+                            "back re-triggered a completed VLN task once",
+                        )
+                        self.agent.publish(
+                            AIMessage(
+                                content=(
+                                    f"[tool:{origin}] An image result arrived "
+                                    f"{age:.0f} s late (it queued behind a long task "
+                                    "turn); it was not shown to the model to avoid "
+                                    "acting on an outdated view."
+                                ),
+                                additional_kwargs={MESSAGE_KIND_KEY: MESSAGE_KIND_TOOL_PROGRESS},
+                            )
+                        )
+                        return
         self.agent_idle.publish(False)
         turn_start = len(self._history)
         self._record(message)
@@ -540,8 +607,36 @@ def _unanswered_tool_calls(messages: list[BaseMessage]) -> Iterator[str]:
                 yield call_id
 
 
+_VLN_PROGRESS_RE = re.compile(r"^turn (?P<turn>\d+)/(?P<max>\d+): (?P<actions>\d+) actions$")
+
+
+def _vln_progress_telemetry(tool_name: str, text: str) -> dict[str, Any] | None:
+    """Structured VLN task telemetry off a tool-update message.
+
+    The VLN skills' tool_update text is "turn 3/50: 4 actions"; the parsed
+    fields ride the cockpit progress frame so the UI can show
+    policy/turn/stage without any LLM round trip. The two policy skills'
+    tool names map to the policy name.
+    """
+    match = _VLN_PROGRESS_RE.match(text.strip())
+    if match is None:
+        return None
+    return {
+        "tool": tool_name,
+        "policy": {"active_vln": "activevln", "stream_vln": "streamvln"}.get(tool_name, tool_name),
+        "current_turn": int(match["turn"]),
+        "max_turns": int(match["max"]),
+        "actions": int(match["actions"]),
+        "stage": "ACTION_EXECUTION",
+    }
+
+
 def _append_image_to_history(agent: Agent, func_name: str, uuid_: str, result: Any) -> None:
     # Tagged with its tool, or chat UIs would show this user turn as typed input.
+    # Generated-at rides along (TOOL_RESULT class, message_kind=tool_result):
+    # _process_message checks the age at consumption time — an image queued
+    # behind a minutes-long VLN run must not reach the LLM as if fresh (it
+    # caused a duplicate active_vln execution; root_cause.md).
     agent.add_message(
         HumanMessage(
             content=[
@@ -551,6 +646,10 @@ def _append_image_to_history(agent: Agent, func_name: str, uuid_: str, result: A
                 },
                 result,
             ],
-            additional_kwargs={TOOL_ORIGIN_KEY: func_name},
+            additional_kwargs={
+                TOOL_ORIGIN_KEY: func_name,
+                MESSAGE_KIND_KEY: "tool_result",
+                GENERATED_AT_KEY: time.time(),
+            },
         )
     )
